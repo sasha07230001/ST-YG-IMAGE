@@ -124,6 +124,8 @@ npm test          # vitest
 
 ## 与上游的关系
 
+本仓库:[**sasha07230001/ST-YG-IMAGE**](https://github.com/sasha07230001/ST-YG-IMAGE)
+
 本插件是 [ST-BaiBai-Image(柏宝绘)](https://github.com/baibai-git/ST-BaiBai-Image) 的重写分支:
 保留了它的全部功能(自动建档、角色库、ComfyUI/NAI 出图、图库、公开接口、移动端 UI),
 新增「中转站编译」这条提示词链(移植自
@@ -132,4 +134,4 @@ npm test          # vitest
 
 因体量已与上游分道扬镳,`src/update.ts` 里**默认关闭了自动更新检测**
 (照旧去拉上游 manifest 只会得到一个永远「有更新」的红点,点下去还会把上游整包覆盖过来)。
-放到自己的仓库后,把那里的地址换成自己的再打开即可。
+REMOTE_MANIFEST_URL 已指向本仓库的 manifest,想启用自动更新把 UPDATE_CHECK_ENABLED 改成 true 即可。

@@ -15,7 +15,7 @@ const CURRENT_VERSION = PLUGIN_VERSION;
  * 照旧去拉上游 manifest 只会得到一个永远「有更新」的红点,点下去还会把上游整包覆盖过来。
  * 故这里默认关闭;真放到自己的 GitHub 仓库后,把下面两行换成自己的地址再打开。
  */
-const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/baibai-git/ST-BaiBai-Image/main/manifest.json';
+const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/sasha07230001/ST-YG-IMAGE/main/manifest.json';
 const UPDATE_CHECK_ENABLED = false;
 
 export const updateState = reactive({
