@@ -269,6 +269,12 @@ export async function generate(
         retry
           ? report({ phase: 'retrying', attempt: retry.attempt, max: retry.max })
           : report({ phase: 'generating' }),
+    }, {
+      // 第三方出图只带「通用常驻词」:角色级常驻与临时状态是用户给自己聊天写的私设,
+      // 别的插件发起出图时不该悄悄带上(也免得它对着不存在的角色写进一堆穿着)。
+      generalOnly: true,
+      // 不重读聊天元数据:公开接口只取一行全局词,没必要为此动聊天状态
+      reload: false,
     });
   } catch (error) {
     throw toPublicError(error);

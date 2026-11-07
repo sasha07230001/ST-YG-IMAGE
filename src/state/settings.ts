@@ -17,6 +17,13 @@ import {
   vibeFingerprint,
   vibeMetaFromData,
 } from '@/backends/vibeStore';
+import {
+  DEFAULT_CHAT_BASE_PROMPT,
+  DEFAULT_TRANSIENT_PROMPT,
+  type ChatBasePrompt,
+  type TransientPromptEntry,
+  type TransientPromptState,
+} from '@/autoTag/characterPrompts';
 import { getContext } from '@/st/context';
 import { reactive, watch } from 'vue';
 
@@ -492,6 +499,77 @@ export interface AutoTagSettings {
   autoGenerate: boolean;
   /** 可编辑提示词集(破限/后端规范/思维链);空串 = 回落内置默认。 */
   prompts: AutoTagPrompts;
+  /**
+   * 每轮让模型从剧情读一次「此刻的穿戴/状态」,写进临时提示词。
+   * 会多一次模型调用;关掉后临时提示词只能手填(仍然照常进 CLIP)。
+   */
+  transientAutoRead: boolean;
+}
+
+/**
+ * 角色档案提示词:常驻(用户手写)与临时(AI 每楼可写)。
+ *
+ * 两者都**追加到 CLIP 文本末尾**(见 autoTag/characterPrompts.ts 的说明:
+ * 恒定画风词已经占了最前面,角色档案是「补充这个人具体长什么样」)。
+ */
+export interface CharacterPromptSettings {
+  /** 常驻提示词。按聊天隔离(存 chatMetadata)。 */
+  base: ChatBasePrompt;
+  /** 临时提示词。按聊天隔离(存 chatMetadata)。 */
+  transient: TransientPromptState;
+}
+
+export const DEFAULT_CHARACTER_PROMPT_SETTINGS: CharacterPromptSettings = {
+  base: DEFAULT_CHAT_BASE_PROMPT,
+  transient: DEFAULT_TRANSIENT_PROMPT,
+};
+
+/**
+ * 常驻/临时提示词的逐字段清洗。
+ *
+ * 刻意宽容:这是用户手写与 AI 生成的混合数据,单个字段脏了不该连累整份——
+ * 名字为空、文本不是字符串、floor 不是数字,一律就地修正或跳过。
+ */
+export function normalizeCharacterPromptSettings(raw: unknown): CharacterPromptSettings {
+  const o = (raw ?? {}) as Partial<CharacterPromptSettings>;
+  const rb = (o.base ?? {}) as Partial<ChatBasePrompt>;
+  const base: ChatBasePrompt = {
+    enabled: typeof rb.enabled === 'boolean' ? rb.enabled : DEFAULT_CHAT_BASE_PROMPT.enabled,
+    general: typeof rb.general === 'string' ? rb.general : '',
+    byChar: {},
+  };
+  if (rb.byChar && typeof rb.byChar === 'object' && !Array.isArray(rb.byChar)) {
+    for (const [name, value] of Object.entries(rb.byChar)) {
+      const key = name.trim();
+      if (!key || typeof value !== 'string' || !value.trim()) continue;
+      base.byChar[key] = value;
+    }
+  }
+
+  const rt = (o.transient ?? {}) as Partial<TransientPromptState>;
+  const seen = new Set<string>();
+  const entries: TransientPromptEntry[] = [];
+  for (const item of Array.isArray(rt.entries) ? rt.entries : []) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as Partial<TransientPromptEntry>;
+    const name = typeof row.name === 'string' ? row.name.trim() : '';
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    entries.push({
+      name,
+      prompt: typeof row.prompt === 'string' ? row.prompt.trim() : '',
+      frozen: row.frozen === true,
+      floor: typeof row.floor === 'number' && Number.isFinite(row.floor) ? Math.floor(row.floor) : 0,
+      at: typeof row.at === 'number' && Number.isFinite(row.at) ? row.at : 0,
+    });
+  }
+  return {
+    base,
+    transient: {
+      enabled: typeof rt.enabled === 'boolean' ? rt.enabled : DEFAULT_TRANSIENT_PROMPT.enabled,
+      entries,
+    },
+  };
 }
 
 /**
@@ -1368,6 +1446,9 @@ function defaults(): ImageSettings {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      // 默认开:装了这个插件的人要的就是「她能记住自己此刻穿着什么」;
+      // 代价是每楼多一次模型调用,觉得费 token 的在角色页关掉即可。
+      transientAutoRead: true,
       prompts: {
         // 默认仍是内置链:升级时不改变存量用户的画面口径(中转站没配 url 也跑不动)
         mode: 'builtin',
@@ -2021,6 +2102,11 @@ function normalize(raw: unknown): ImageSettings {
         : d.autoTag.retryCount,
     autoGenerate:
       typeof rt.autoGenerate === 'boolean' ? rt.autoGenerate : d.autoTag.autoGenerate,
+    // 后加字段:老配置无此键 → 默认开(与加字段前的行为无关,这一层本来就不存在)
+    transientAutoRead:
+      typeof rt.transientAutoRead === 'boolean'
+        ? rt.transientAutoRead
+        : d.autoTag.transientAutoRead,
     // 可编辑提示词集:逐字段兜底;旧版 jailbreakPrompt 字段迁移进 prompts.jailbreak
     prompts: (() => {
       const rp = (rt.prompts ?? {}) as Partial<AutoTagPrompts>;

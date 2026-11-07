@@ -44,6 +44,17 @@
 7. **公开接口不变**:`globalThis.STBaiBaiImage` 名称与 `apiVersion: 1` 照旧
    (第三方代码零改动);中转站的 key 与地址不出现在任何公开返回值里。
 
+7.5. **角色档案提示词(常驻 / 临时)** —— `src/autoTag/characterPrompts.ts`(纯函数)
+   + `src/state/characterPromptStore.ts`(按聊天的读写层)。
+   - 三层的分工与「为什么插在 CLIP 末尾」写在 `characterPrompts.ts` 文件头;
+   - **追加点在 `generate.ts` 的 `generateImage`**,不在各后端:那是卡片与公开接口的唯一出图路径,
+     放后端里会漂(ComfyUI custom/simple + NAI 共三条分支,漏一处就是一处静默失效);
+   - 在场所取 `characters[]`;判不出在场者时只取通用常驻(不然会给不在场角色套上穿着);
+   - 同角色有临时状态时,常驻段**整段让位**(两串同进 CLIP = 衣服糊成一片);
+   - 存储 `chatMetadata['yg_character_prompts']`,写操作防抖 300ms + 切聊天时 flush;
+   - AI 读取那一跳在 `runner.ts` 的 `readTransientForFloor`:独立一次模型调用,
+     **不并进主请求**(并进去模型会把换装写进固定档案),失败只 warn 不影响出图;
+   - 公开接口 `generate()` 显式传 `{ generalOnly: true, reload: false }`。
 8. **自动更新默认关闭**(`src/update.ts` 的 `UPDATE_CHECK_ENABLED = false`):
    上游 manifest 与本插件版本无关联,照旧去拉会得到一个永远「有更新」且会把上游整包
    覆盖过来的红点。放到自己的仓库后改掉地址再打开。

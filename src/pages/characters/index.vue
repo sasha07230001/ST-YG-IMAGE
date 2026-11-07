@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import BbiTextarea from '@/components/BbiTextarea.vue';
+import { settings } from '@/state/settings';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
@@ -28,7 +29,21 @@ import {
   upsertGlobalCharTag,
 } from '@/state/globalCharTags';
 import { getContext } from '@/st/context';
-import { computed, ref } from 'vue';
+import { computed, reactive, ref } from 'vue';
+import {
+  basePrompt,
+  clearAllTransients,
+  clearTransient,
+  isEntryStale,
+  previewCharacterPrompts,
+  setBaseEnabled,
+  setBaseForChar,
+  setBaseGeneral,
+  setTransientEnabled,
+  setTransientForChar,
+  setTransientFrozen,
+  temporaryPrompt,
+} from '@/state/characterPromptStore';
 
 /**
  * 角色管理 —— 两层固定外貌库:
@@ -320,6 +335,112 @@ function confirmRollback() {
 function sourceLabel(entry: CharTagEntry): string {
   return entry.source === 'book' ? '柏宝书' : entry.source === 'ai' ? 'AI 维护' : '手动';
 }
+
+/* ============ 常驻 / 临时提示词(追加到 CLIP 末尾的那一段) ============ */
+
+const currentFloor = computed(() => Math.max(0, (getContext()?.chat?.length ?? 1) - 1));
+
+/** 常驻词的编辑草稿:按角色名建一份,失焦/回车即写入 chatMetadata。 */
+const baseDrafts = reactive<Record<string, string>>({});
+const baseGeneralDraft = ref(basePrompt.general);
+const transientDrafts = reactive<Record<string, string>>({});
+
+/** 词库条目名(全局 + 本聊天),常驻/临时两栏都按它列行。 */
+const promptRows = computed(() => {
+  const names = new Set<string>();
+  for (const entry of globalCharTagLib.entries) names.add(entry.name);
+  for (const entry of chatEntries.value) names.add(entry.name);
+  for (const name of Object.keys(basePrompt.byChar)) names.add(name);
+  for (const entry of temporaryPrompt.entries) names.add(entry.name);
+  return [...names].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+});
+
+function baseFor(name: string): string {
+  return baseDrafts[name] ?? basePrompt.byChar[name] ?? '';
+}
+
+function commitBase(name: string): void {
+  const text = (baseDrafts[name] ?? '').trim();
+  if (text === (basePrompt.byChar[name] ?? '').trim()) {
+    delete baseDrafts[name];
+    return;
+  }
+  setBaseForChar(name, text);
+  delete baseDrafts[name];
+  toastr.success(`「${name}」的常驻提示词已保存`, 'YG 插图师');
+}
+
+function commitBaseGeneral(): void {
+  if (baseGeneralDraft.value === basePrompt.general) return;
+  setBaseGeneral(baseGeneralDraft.value);
+  toastr.success('通用常驻提示词已保存', 'YG 插图师');
+}
+
+function transientOf(name: string) {
+  return temporaryPrompt.entries.find(entry => entry.name === name) ?? null;
+}
+
+function transientText(name: string): string {
+  return transientDrafts[name] ?? transientOf(name)?.prompt ?? '';
+}
+
+function commitTransient(name: string): void {
+  const text = (transientDrafts[name] ?? '').trim();
+  const current = transientOf(name);
+  if (text === (current?.prompt ?? '').trim()) {
+    delete transientDrafts[name];
+    return;
+  }
+  if (current?.frozen) {
+    toastr.warning(`「${name}」的临时提示词已冻结,先解冻才能改`, 'YG 插图师');
+    return;
+  }
+  setTransientForChar(name, text, { floor: currentFloor.value });
+  delete transientDrafts[name];
+  toastr.success(
+    text ? `「${name}」的临时提示词已保存` : `已清空「${name}」的临时提示词,回到固定档案`,
+    'YG 插图师',
+  );
+}
+
+function toggleFrozen(name: string): void {
+  const entry = transientOf(name);
+  if (!entry) return;
+  setTransientFrozen(name, !entry.frozen);
+}
+
+function clearOneTransient(name: string): void {
+  clearTransient(name);
+  delete transientDrafts[name];
+}
+
+function askClearAll(): void {
+  confirmClearTransientOpen.value = true;
+}
+function confirmClearAll(): void {
+  confirmClearTransientOpen.value = false;
+  clearAllTransients();
+  for (const key of Object.keys(transientDrafts)) delete transientDrafts[key];
+  toastr.success('已清空全部临时提示词', 'YG 插图师');
+}
+
+/** 预览:当前楼层、当前在场者(NPC 词条全部算在场,预览用)合成出来的那一串。 */
+const promptPreview = computed(() =>
+  previewCharacterPrompts(promptRows.value).text,
+);
+
+/** 清空全部临时提示词的二次确认。 */
+const confirmClearTransientOpen = ref(false);
+
+/** 「常驻 / 临时提示词」整块的展开态(默认收起,和角色库不是一个用途)。 */
+const promptSectionShown = ref(false);
+
+/** 这段东西最终会以什么样子进 CLIP:恒定词 → 画面 tag → 角色档案(见 characterPrompts.ts)。 */
+const previewHint = computed(() => {
+  const archive = promptPreview.value;
+  if (!archive) return '当前没有任何内容会追加到 CLIP。';
+  return `最终形态:画风词, 模型编译的画面 tag, ${archive}`;
+});
 </script>
 
 <template>
@@ -332,6 +453,173 @@ function sourceLabel(entry: CharTagEntry): string {
     <p class="bbi-field-hint">
       角色固定外貌库:生成 tag 时 AI 照抄库中字段,@角色名 占位符也会被替换为库中最新外貌,稳定不漂移。
     </p>
+
+    <!-- ===== 常驻提示词 / 临时提示词:追加到 CLIP 文本末尾 ===== -->
+    <div class="bbi-char-section">
+      <div class="bbi-char-section-head">
+        <button
+          class="bbi-fold-head"
+          type="button"
+          :aria-expanded="promptSectionShown"
+          @click="promptSectionShown = !promptSectionShown"
+        >
+          <Icon name="chevron" class="bbi-fold-caret" :class="{ 'is-collapsed': !promptSectionShown }" />
+          <span class="bbi-field-label">常驻提示词 / 临时提示词</span>
+        </button>
+        <span class="bbi-count">进 CLIP</span>
+      </div>
+      <div class="bbi-fold-wrap" :class="{ 'is-collapsed': !promptSectionShown }">
+        <div class="bbi-fold-inner">
+          <p class="bbi-field-hint">
+            这两份都<strong>追加到 ComfyUI 的 CLIP 文本末尾</strong>:画风词在最前、模型编译的画面 tag 居中、
+            它们收尾。按聊天隔离,换聊天各管各的。<strong>常驻</strong>由你手写(AI 永不修改),
+            <strong>临时</strong>每楼由 AI 读剧情更新,也可手改 / 冻结 / 清空。
+          </p>
+
+          <!-- 常驻:通用段 -->
+          <label class="bbi-switch-row">
+            <span class="bbi-field-label">启用常驻提示词</span>
+            <input
+              :checked="basePrompt.enabled"
+              type="checkbox"
+              class="bbi-checkbox"
+              @change="setBaseEnabled(($event.target as HTMLInputElement).checked)"
+            />
+          </label>
+
+          <div class="bbi-field">
+            <div class="bbi-field-head"><span class="bbi-field-label">通用常驻(所有角色都生效)</span></div>
+            <BbiTextarea
+              v-model="baseGeneralDraft"
+              :rows="2"
+              :max-rows="5"
+              mono
+              placeholder="如 cold color palette, desaturated, film grain"
+              @blur="commitBaseGeneral"
+            />
+            <p class="bbi-field-hint">逗号分隔的 tag,直接进 CLIP;留空不生效。</p>
+          </div>
+
+          <hr class="bbi-rule" />
+
+          <!-- 临时:总开关 + 批量清空 -->
+          <label class="bbi-switch-row">
+            <span class="bbi-field-label">启用临时提示词</span>
+            <input
+              :checked="temporaryPrompt.enabled"
+              type="checkbox"
+              class="bbi-checkbox"
+              @change="setTransientEnabled(($event.target as HTMLInputElement).checked)"
+            />
+          </label>
+          <label class="bbi-switch-row">
+            <span class="bbi-field-label">每楼让模型读取当前装扮</span>
+            <input v-model="settings.autoTag.transientAutoRead" type="checkbox" class="bbi-checkbox" />
+          </label>
+          <p class="bbi-field-hint">
+            每楼多一次模型调用,读出现在穿着什么、伤势、束缚这类「会变」的状态。关掉后只能手填。
+          </p>
+
+          <div class="bbi-channel-bar">
+            <span class="bbi-field-label">已记录 {{ temporaryPrompt.entries.length }} 个角色</span>
+            <button
+              class="bbi-btn bbi-btn-sm bbi-btn-danger"
+              type="button"
+              :disabled="!temporaryPrompt.entries.length"
+              @click="askClearAll"
+            >
+              <Icon name="trash" /> 全部清空
+            </button>
+          </div>
+
+          <!-- 逐角色:常驻 + 临时两行 -->
+          <ul v-if="promptRows.length" class="yg-prompt-rows">
+            <li v-for="name in promptRows" :key="name" class="yg-prompt-row">
+              <div class="yg-prompt-row-head">
+                <span class="bbi-char-name">{{ name }}</span>
+                <span
+                  v-if="transientOf(name) && isEntryStale(transientOf(name)!, currentFloor)"
+                  class="bbi-char-pill is-override"
+                  title="这条记录的楼层离当前太远,出图时会被作废"
+                >
+                  已过期
+                </span>
+                <span v-if="transientOf(name)?.frozen" class="bbi-char-pill is-book">冻结</span>
+              </div>
+
+              <div class="yg-prompt-line">
+                <span class="bbi-field-label yg-prompt-label">常驻</span>
+                <input
+                  class="bbi-input"
+                  type="text"
+                  spellcheck="false"
+                  placeholder="这个角色在本聊天里的补充设定(留空不生效)"
+                  :value="baseFor(name)"
+                  @input="baseDrafts[name] = ($event.target as HTMLInputElement).value"
+                  @blur="commitBase(name)"
+                  @keydown.enter.prevent="commitBase(name)"
+                />
+              </div>
+
+              <div class="yg-prompt-line">
+                <span class="bbi-field-label yg-prompt-label">临时</span>
+                <input
+                  class="bbi-input"
+                  type="text"
+                  spellcheck="false"
+                  placeholder="此刻的穿戴/状态(AI 每楼更新,可手改)"
+                  :value="transientText(name)"
+                  :disabled="transientOf(name)?.frozen === true"
+                  @input="transientDrafts[name] = ($event.target as HTMLInputElement).value"
+                  @blur="commitTransient(name)"
+                  @keydown.enter.prevent="commitTransient(name)"
+                />
+                <button
+                  v-if="transientOf(name)"
+                  class="bbi-btn bbi-btn-sm"
+                  type="button"
+                  :title="transientOf(name)?.frozen ? '解冻:允许 AI 改写' : '冻结:AI 不再改写这条'"
+                  @click="toggleFrozen(name)"
+                >
+                  {{ transientOf(name)?.frozen ? '解冻' : '冻结' }}
+                </button>
+                <button
+                  v-if="transientOf(name)"
+                  class="bbi-btn bbi-btn-sm bbi-btn-danger"
+                  type="button"
+                  title="清空这条,回到固定档案"
+                  @click="clearOneTransient(name)"
+                >
+                  <Icon name="close" />
+                </button>
+              </div>
+            </li>
+          </ul>
+          <p v-else class="bbi-char-empty">
+            角色库还是空的。先在上面建档,这里的每一行才会出现可按角色填写。
+          </p>
+
+          <!-- 最终形态预览 -->
+          <div class="bbi-char-preview">
+            <span class="bbi-field-label">追加到 CLIP 的内容</span>
+            <code class="bbi-char-preview-tag">{{ promptPreview || '(空)' }}</code>
+            <span class="bbi-field-hint">{{ previewHint }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <ConfirmDialog
+      v-model:open="confirmClearTransientOpen"
+      title="清空全部临时提示词"
+      confirm-text="清空"
+      confirm-icon="trash"
+      tone="danger"
+      @confirm="confirmClearAll"
+    >
+      清空本聊天里所有角色的临时提示词?之后出图只按固定档案与常驻词来,
+      下一轮里 AI 会从剧情重新读一遍。
+    </ConfirmDialog>
 
     <!-- ===== 全局角色库 ===== -->
     <div class="bbi-char-section">
@@ -1058,6 +1346,74 @@ function sourceLabel(entry: CharTagEntry): string {
   }
   .bbi-char-name {
     font-size: 14px;
+  }
+}
+
+/* ===== 常驻 / 临时提示词:逐角色两行 =====
+   一行 = 标签(固定宽) + 输入框(撑满) + 最多两颗按钮。
+   窄屏下按钮换到下一行,输入框仍占满带宽 —— 手机上点不到是最容易犯的错。 */
+.yg-prompt-rows {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.yg-prompt-row {
+  padding: 10px 12px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius);
+  background: var(--bbi-surface-2);
+}
+
+.yg-prompt-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.yg-prompt-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* 标签列固定宽度,两行输入框左缘对齐 —— 不设宽度时「常驻」「临时」两个词宽度不同,
+   输入框会错开一格,看起来像两个不相关的字段。 */
+.yg-prompt-label {
+  flex: 0 0 32px;
+  font-size: 12px;
+  color: var(--bbi-ink-muted);
+}
+
+.yg-prompt-line .bbi-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.yg-prompt-line .bbi-btn {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 640px) {
+  .yg-prompt-line {
+    flex-wrap: wrap;
+  }
+  .yg-prompt-line .bbi-input {
+    flex: 1 1 100%;
+    order: 2;
+    /* iOS Safari 对小于 16px 的输入框会自动放大整页 */
+    font-size: 16px;
+  }
+  .yg-prompt-label {
+    order: 1;
+  }
+  .yg-prompt-line .bbi-btn {
+    order: 3;
   }
 }
 </style>

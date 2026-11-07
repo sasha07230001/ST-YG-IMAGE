@@ -1,9 +1,9 @@
 {
   "name": "st-yg-image",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
-  "description": "YG · 插图师：SillyTavern 剧情配图扩展。提示词可由内置 LLM 分析，也可交给中转站模型编译成 CLIP 提示词",
+  "description": "YG 插图师：SillyTavern 剧情配图扩展。提示词可由内置 LLM 分析，也可交给中转站模型编译成 CLIP 提示词",
   "license": "MIT",
   "scripts": {
     "sync-version": "node scripts/sync-version.mjs",
@@ -12,10 +12,12 @@
     "prewatch": "node scripts/sync-version.mjs",
     "watch": "vite build --watch --mode development",
     "typecheck": "vue-tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "node scripts/smoke-character-prompts.mjs"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.7",
+    "jsdom": "^31.0.0",
     "typescript": "^5.7.0",
     "vite": "^7.3.3",
     "vitest": "^4.1.10",

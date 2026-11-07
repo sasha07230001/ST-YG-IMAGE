@@ -30,6 +30,8 @@ import { effectiveOrientation, parseSize, pickSize, type Orientation } from '@/b
 import { acquireNaiSlot } from '@/floor/genQueue';
 import type { GenerationMeta } from '@/generationMeta';
 import { activeComfyPreset, activeNaiEndpoint, activeOrientationLock, effectiveComfyConn, effectiveNai, settings, type BackendId } from '@/state/settings';
+import { resolveCharacterPrompts } from '@/state/characterPromptStore';
+import { appendCharacterPrompts } from '@/autoTag/characterPrompts';
 
 /** 一次生成的输入。与协议层 ImageInsertion 同形,但不含正文位置信息。 */
 export interface GenerateInput {
@@ -60,6 +62,21 @@ export interface GenerateProgress {
   onRetry?: (retry: { attempt: number; max: number } | null) => void;
 }
 
+/**
+ * 角色档案提示词的取用开关。**默认全开**,公开接口显式关掉——
+ * 那条路是第三方插件自己发起的出图,不该在用户不知情时把他的角色私设一起送进去。
+ */
+export interface CharacterPromptOptions {
+  /** 是否追加常驻/临时提示词。默认 true。 */
+  enabled?: boolean;
+  /** 只要通用常驻词,不带任何角色级内容。默认 false。 */
+  generalOnly?: boolean;
+  /** 当前楼层(用于淘汰过期临时词);缺省取聊天最后一条。 */
+  floor?: number;
+  /** 是否先重读 chatMetadata。默认 true;公开接口传 false。 */
+  reload?: boolean;
+}
+
 export interface GenerateOutput {
   result: ComfyImageResult;
   /** 本次实际使用的种子(原样回传,调用方不必自己记)。 */
@@ -79,6 +96,14 @@ export interface GenerateOutput {
    * NAI 的画师串与 vibe 不在 tag 文本里，不在这里冒泡出去就只能永久丢失。
    */
   meta: GenerationMeta;
+  /**
+   * 本次实际追加到 CLIP 文本末尾的「角色档案提示词」(常驻 + 临时合成结果,可为空串)。
+   *
+   * 为什么冒泡出来:它**不在 tag 文本里**(tag 原文只记模型写的东西),
+   * 不在这里带出去就只能永久丢失 —— 用户事后想复现这张图、或者想知道
+   * 「为什么这张多出了 black lace bra」,没这条线索就查不了。
+   */
+  characterPrompt: string;
 }
 
 /** 后端就绪状态。 */
@@ -174,6 +199,8 @@ export async function generateImage(
   input: GenerateInput,
   signal?: AbortSignal,
   progress: GenerateProgress = {},
+  /** 角色档案提示词的取用开关(常驻 / 临时);默认全开,公开接口会显式关掉。 */
+  characterPrompts: CharacterPromptOptions = {},
 ): Promise<GenerateOutput> {
   const status = backendStatus();
   // 兜底:卡片侧已用 configured 拦在按钮上,公开接口侧也会先报 not_configured。
@@ -184,6 +211,31 @@ export async function generateImage(
   const characters = input.characters ?? [];
   // 支持与否由后端说了算:ComfyUI 恒不支持;NAI 看模型是否 4.5/V5
   const charactersApplied = characters.length > 0 && status.supportsCharacters;
+
+  /**
+   * 角色档案提示词(常驻 + 临时)——**在这里追加,不是在各后端里**。
+   *
+   * 放在 generateImage 的原因:它是楼层卡片与公开接口的**唯一**出图路径,
+   * 接在此处才能保证「不管谁出图、走 ComfyUI 还是 NAI,只要用户开了就都带上」。
+   * 放各后端里会漂:ComfyUI 的 custom/simple 两条分支 + NAI 一条,漏一处就是一处静默失效。
+   *
+   * 在场角色取 characters[](NAI 4.5/V5 的结构化多角色),ComfyUI 那条链不传该字段,
+   * 于是退化为「只取通用常驻词 + 无法判定在场者时不带角色级内容」——
+   * 宁可少带,也不能把不在场角色的穿着写进这张图(那是凭空多一个人的头号成因)。
+   */
+  const present = characters.map(character => character.name).filter(Boolean);
+  const archive =
+    characterPrompts.enabled === false
+      ? { text: '', names: [] as string[] }
+      : resolveCharacterPrompts({
+          floor: characterPrompts.floor,
+          present,
+          generalOnly: characterPrompts.generalOnly === true,
+          // 楼层卡片走默认的 reload:用户可能刚在角色页改过常驻词
+          reload: characterPrompts.reload !== false,
+        });
+  const prompt = appendCharacterPrompts(input.prompt, archive.text);
+  const nl = input.nl ?? '';
 
   let release: (() => void) | null = null;
   try {
@@ -201,7 +253,7 @@ export async function generateImage(
         effectiveNai(),
         // characters 原样透传:不支持的模型由 buildNaiParameters 自己滤掉(同一口径
         // naiSupportsCharacterPrompts),在这儿再滤一遍只会多一处会漂的判据
-        { prompt: input.prompt, nl: input.nl ?? '', characters, seed: input.seed, size },
+        { prompt, nl, characters, seed: input.seed, size },
         signal,
         { onRetry: info => progress.onRetry?.({ attempt: info.attempt, max: info.max }) },
       );
@@ -212,8 +264,8 @@ export async function generateImage(
       result = await generateComfyImage(
         conn,
         {
-          prompt: input.prompt,
-          nl: input.nl ?? '',
+          prompt,
+          nl,
           negative_prompt: input.negative ?? '',
           seed: input.seed,
           size,
@@ -227,8 +279,8 @@ export async function generateImage(
       const width = px?.width ?? 0;
       const height = px?.height ?? 0;
       const simpleValues: SimpleGenValues = {
-        prompt: input.prompt,
-        nl: input.nl,
+        prompt,
+        nl,
         negative: input.negative,
         seed: input.seed,
         width,
@@ -250,7 +302,16 @@ export async function generateImage(
 
     // 退避文案到此为止:图已拿到,落盘还要一会儿,不该继续显示「稍后重试」
     progress.onRetry?.(null);
-    return { result, seed: input.seed, size, backend: status.backend, charactersApplied, meta };
+    return {
+      result,
+      seed: input.seed,
+      size,
+      backend: status.backend,
+      charactersApplied,
+      meta,
+      // 这次实际追加的角色档案串(灯箱与图库要能回溯「这张图为什么多了这几个词」)
+      characterPrompt: archive.text,
+    };
   } finally {
     release?.();
   }

@@ -190,7 +190,7 @@ describe('generate', () => {
     ready();
     const result = fakeResult();
     vi.mocked(generateImage).mockResolvedValue({
-      result, seed: 4242, size: 'landscape', backend: 'nai', charactersApplied: true, meta: fakeMeta(),
+      result, seed: 4242, size: 'landscape', backend: 'nai', charactersApplied: true, meta: fakeMeta(), characterPrompt: '',
     });
 
     await generate({
@@ -218,7 +218,7 @@ describe('generate', () => {
   it('reports charactersApplied=false when the backend dropped them (ComfyUI)', async () => {
     ready({ backend: 'comfyui', model: '默认工作流', supportsCharacters: false });
     vi.mocked(generateImage).mockResolvedValue({
-      result: fakeResult(), seed: 7, size: 'portrait', backend: 'comfyui', charactersApplied: false, meta: fakeMeta(),
+      result: fakeResult(), seed: 7, size: 'portrait', backend: 'comfyui', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
 
     const out = await generate({ prompt: '1girl', characters: [{ name: 'a', tag: 'b' }] });
@@ -229,7 +229,7 @@ describe('generate', () => {
   it('saves to the gallery by default and skips it only when told to', async () => {
     ready();
     vi.mocked(generateImage).mockResolvedValue({
-      result: fakeResult(), seed: 4242, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(),
+      result: fakeResult(), seed: 4242, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
 
     const saved = await generate({ prompt: '1girl' });
@@ -242,7 +242,7 @@ describe('generate', () => {
 
     vi.mocked(saveExternalImage).mockClear();
     vi.mocked(generateImage).mockResolvedValue({
-      result: fakeResult(), seed: 4242, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(),
+      result: fakeResult(), seed: 4242, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
     const skipped = await generate({ prompt: '1girl', save: false });
     expect(skipped.path).toBeNull();
@@ -254,7 +254,7 @@ describe('generate', () => {
     vi.mocked(saveExternalImage).mockClear();
     // 渠道锁横图:请求要竖,generateImage 回报实际按横出
     vi.mocked(generateImage).mockResolvedValue({
-      result: fakeResult(), seed: 4242, size: 'landscape', backend: 'nai', charactersApplied: false, meta: fakeMeta(),
+      result: fakeResult(), seed: 4242, size: 'landscape', backend: 'nai', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
 
     await generate({ prompt: '1girl', size: 'portrait' });
@@ -266,7 +266,7 @@ describe('generate', () => {
   it('still returns the image when saving to the gallery fails', async () => {
     ready();
     vi.mocked(generateImage).mockResolvedValue({
-      result: fakeResult(), seed: 4242, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(),
+      result: fakeResult(), seed: 4242, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
     vi.mocked(saveExternalImage).mockRejectedValueOnce(new Error('磁盘满了'));
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -280,14 +280,14 @@ describe('generate', () => {
     ready();
     const ok = fakeResult();
     vi.mocked(generateImage).mockResolvedValue({
-      result: ok, seed: 1, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(),
+      result: ok, seed: 1, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
     await generate({ prompt: '1girl', save: false });
     expect(ok.revoke).toHaveBeenCalledTimes(1);
 
     const failing = fakeResult('blob:http://x/y');
     vi.mocked(generateImage).mockResolvedValue({
-      result: failing, seed: 1, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(),
+      result: failing, seed: 1, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
     vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 404 })));
     await expect(generate({ prompt: '1girl', save: false })).rejects.toMatchObject({
@@ -300,7 +300,7 @@ describe('generate', () => {
   it('never lets a third-party progress callback break the generation', async () => {
     ready();
     vi.mocked(generateImage).mockResolvedValue({
-      result: fakeResult(), seed: 1, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(),
+      result: fakeResult(), seed: 1, size: 'portrait', backend: 'nai', charactersApplied: false, meta: fakeMeta(), characterPrompt: '',
     });
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 

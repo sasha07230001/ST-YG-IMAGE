@@ -1,4 +1,4 @@
-import { requestCompletion, requestViaMainApi, requestViaRelay } from '@/api/client';
+import { requestCompletion, requestViaMainApi, requestViaRelay, type ChatMsg } from '@/api/client';
 import { readBookMemory } from '@/autoTag/bookMemory';
 import {
   applyPositionedCharRefs,
@@ -6,6 +6,11 @@ import {
   type PositionedCharOp,
 } from '@/autoTag/charAnchors';
 import { prepareTargetText } from '@/autoTag/clean';
+import {
+  buildTransientTaskPrompt,
+  parseTransientReply,
+} from '@/autoTag/characterPrompts';
+import { clearTransient, setTransientForChar, temporaryPrompt } from '@/state/characterPromptStore';
 import { beginGeneration, clearGeneration, consumeGeneration } from '@/autoTag/generationGate';
 import { autoTagProfile, buildAutoTagMessages } from '@/autoTag/prompt';
 import { rebaseImagePositions, type RebaseReport } from '@/autoTag/rebase';
@@ -326,6 +331,26 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     // 两者的差异只在「这一楼的 tag 从哪来」;装配上下文(世界书/角色库/位置 ID/写回/出图)
     // 全部共用,故分叉只发生在请求这一步,见下。
     const relayMode = profile.mode === 'relay';
+
+    /**
+     * 临时提示词:让模型从本楼正文读一次「此刻的穿戴/状态」。
+     *
+     * 两条提示词链共用这一步,而且它**不参与 tag 生成**——写完就落进
+     * chatMetadata,出图时由 generate.ts 追加到 CLIP 末尾(见 characterPrompts.ts)。
+     * 刻意不复用主请求:主请求要产出结构化 tag,再让它顺手维护一套穿戴账本,
+     * 模型会把「换了黑色蕾丝」写进固定档案,越用越歪。
+     *
+     * 失败一律吞掉(只 warn):临时状态是锦上添花,不该让整楼出图失败。
+     */
+    if (!slot && settings.autoTag.transientAutoRead) {
+      try {
+        await readTransientForFloor(floor, preparedTarget.segments.map(s => s.text).join('\n\n'), controller.signal);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          console.warn(`[YG 插图师] 第 ${floor} 楼读取临时提示词失败(不影响出图)`, error);
+        }
+      }
+    }
     // 失败重试:请求异常与「返回无法解析/校验不通过」都视为可重试的异常(后者常见于模型没遵守协议);
     // 中止信号立即收手,不消耗重试。parseImagePlan 对坏输出抛错,「无画面」则是正常返回空数组。
     // 解析/校验放进 validate 回调:不过则请求历史如实记为失败(而非「HTTP 拿到文本」的绿色成功),
@@ -627,6 +652,64 @@ function scheduleForGeneratedFloor(floor: number, chatId: string): void {
     void runForFloor(floor);
   }, 0);
   scheduled.add(timer);
+}
+
+/**
+ * 临时提示词的独立读取:正文 → 一次模型调用 → 「角色: tag 串」→ 落 chatMetadata。
+ *
+ * 与主请求分开的理由见调用处注释(合并会让模型把换装写进固定档案)。
+ * 送的是**本楼清洗后的正文**(不带历史、不带角色库):穿戴/伤势这类状态只跟「此刻这一段」有关,
+ * 把前几楼一起塞进去反而会让它把上一套衣服写回来。
+ */
+async function readTransientForFloor(
+  floor: number,
+  story: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const known = charTagsBeforeFloor(floor + 1)
+    .map(entry => entry.name)
+    .filter(Boolean);
+  // 没有已知角色、也没有任何临时条目时没什么可读的:不让它凭空给路人建档
+  const tracked = known.length
+    ? known
+    : temporaryPrompt.entries.map(entry => entry.name);
+  if (!tracked.length || !story.trim()) return;
+
+  const messages: ChatMsg[] = [
+    { role: 'system', content: buildTransientTaskPrompt(tracked) },
+    { role: 'user', content: `【剧情正文】\n${story}` },
+  ];
+
+  // 渠道口径与主链路一致:指派了副 API 就走副 API,否则跟随主 API。
+  // 中转站模式同样改走中转站(它是用户为「读正文」这件事专门配的那台模型)。
+  const relayMode = settings.autoTag.prompts.mode === 'relay';
+  const channel = getTagGenChannel();
+  const raw = relayMode
+    ? await requestViaRelay(messages, { signal, source: `临时提示词(第 ${floor} 楼)` })
+    : channel
+      ? await requestCompletion(channel, messages, { signal, source: `临时提示词(第 ${floor} 楼)` })
+      : await requestViaMainApi(messages, { signal, source: `临时提示词(第 ${floor} 楼)` });
+
+  const parsed = parseTransientReply(raw, tracked);
+  if (!parsed.length) return;
+
+  let updated = 0;
+  let cleared = 0;
+  for (const item of parsed) {
+    const existing = temporaryPrompt.entries.find(entry => entry.name === item.name);
+    // 冻结的条目 AI 不许改,连「清空」也不许 —— 冻结的语义就是「由我说了算」
+    if (existing?.frozen) continue;
+    if (item.cleared) {
+      if (existing) {
+        clearTransient(item.name);
+        cleared += 1;
+      }
+      continue;
+    }
+    setTransientForChar(item.name, item.prompt, { floor });
+    updated += 1;
+  }
+  diagnostic('transient:applied', { floor, updated, cleared, parsed: parsed.length });
 }
 
 /**
