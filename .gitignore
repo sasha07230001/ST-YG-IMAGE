@@ -1,0 +1,17 @@
+node_modules/
+*.log
+.DS_Store
+.preview/
+.preview/shot-*.png
+.claude
+.codex/
+.aionrs/
+CLAUDE.md
+.pnpm-store/
+AGENTS.md
+.pi/
+data/
+
+# 构建产物要提交(dist/index.js 是 ST 直接加载的那份)，
+# 但 sourcemap 有 2.5 MB 且随时可重建，不上仓库。
+dist/*.map
