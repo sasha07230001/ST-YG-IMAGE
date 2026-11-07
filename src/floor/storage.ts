@@ -42,6 +42,15 @@ export interface BbiImageEntry {
   /** 出图元信息（画师串/vibe/采样参数）。图库当前聊天的快速通道读它，避免逐张抓侧写；
    *  旧数据没有此键。 */
   meta?: GenerationMeta;
+  /**
+   * 这张图是谁要的:
+   * - `auto`(或缺省) = 自动流程写 tag 后出的图;
+   * - `manual` = 用户手填提示词出的图(见 floor/manualPrompt.ts)。
+   *
+   * 必须分开记:手动图的提示词是**当场敲的**,和正文里那条 tag 没有关系。
+   * 不标记的话,用户在卡片上重绘/看提示词时会以为它读的是正文那条 tag。
+   */
+  origin?: 'auto' | 'manual';
 }
 
 /** [swipeId][promptHash] = 历史 entry 列表。 */
@@ -418,6 +427,8 @@ export async function saveImageResult(
   seed: number,
   result: ComfyImageResult,
   meta?: GenerationMeta,
+  /** 这张图的来源;缺省 = 自动流程(存量行为完全不变)。 */
+  origin: BbiImageEntry['origin'] = 'auto',
 ): Promise<BbiImageEntry> {
   const ctx = getContext();
   if (!ctx?.saveChat) throw new Error('SillyTavern 上下文不可用');
@@ -446,6 +457,8 @@ export async function saveImageResult(
     createdAt,
     slotSeq: seq,
     ...(meta ? { meta } : {}),
+    // 只在手动图时写这个键:存量数据不该因为这次升级凭空多出一个字段
+    ...(origin === 'manual' ? { origin } : {}),
   };
 
   const saved = await mutateStore(ctx, messageId, store => appendEntry(store, swipeId, hash, entry));

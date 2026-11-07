@@ -239,6 +239,21 @@
   pointer-events: none;
 }
 
+/* 「手动提示词」来源标:与「旧提示词」同位置,用中性色区分开 ——
+   它不是一个警告,只是提示「这几个词是人敲的」,不该用警示色抢注意力。 */
+.bbi-figure__badge--manual {
+  color: var(--bbi-ink-soft);
+  background: oklch(1 0 0 / 0.82);
+  border: 1px solid var(--bbi-line);
+  backdrop-filter: blur(4px);
+}
+
+/* 两个角标同时在场(手动图 + 旧提示词)时错开,不要叠在一起 */
+.bbi-figure__badge--manual + .bbi-figure__badge,
+.bbi-figure__badge:has(+ .bbi-figure__badge--manual) {
+  top: 30px;
+}
+
 /* ——— 悬浮操作组:右上角 ⋯ 收纳钮 ———
    全平台统一:⋯ 常驻淡显,钉死在右上角(row-reverse 保证菜单展开时它不位移),
    菜单在其左侧横向排开:桌面(hover:hover)hover ⋯ 时浮现,触屏(hover:none)点 ⋯ 展开、

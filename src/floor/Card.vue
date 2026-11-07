@@ -213,6 +213,11 @@ const downloadFileName = (entry: BbiImageEntry): string => {
 };
 /** 展示的图是否属于旧提示词(有旧结果但当前提示词还没出过图)。 */
 const isStale = computed(() => !liveHistory.value.length && !!liveStale.value);
+/**
+ * 这张图是不是「手动提示词生图」出来的(见 floor/manualPrompt.ts)。
+ * 只看当前展示的那一条:用户可能在同一个槽位里既手打过也让它自动重绘过。
+ */
+const isManualImage = computed(() => shownEntry.value?.origin === 'manual');
 /** 生成中/排队中仍显示上一张(若有),避免卡片塌空;骨架叠在其上。 */
 const busy = computed(() => phase.value === 'generating' || phase.value === 'queued');
 /** 历史翻页:多于一张且不忙才给(按存活张数,破指针不占格)。 */
@@ -532,6 +537,14 @@ onMounted(() => {
 
       <!-- 提示词已改:角标提示,不再整图压暗 -->
       <span v-if="isStale && !busy && !planning" class="bbi-figure__badge">旧提示词</span>
+
+      <!-- 手动提示词生图的结果:标明来源,免得用户以为它是模型读了正文写出来的 -->
+      <span
+        v-if="isManualImage && !busy && !planning"
+        class="bbi-figure__badge bbi-figure__badge--manual"
+        title="这张图来自「手动提示词生图」:提示词是当时手敲的,不是模型生成的"
+        >手动提示词</span
+      >
 
       <!-- 悬浮操作组:⋯ 收纳钮钉在右上角常驻淡显;桌面 hover、触屏点开,菜单都在其左侧横向排开
            (窄图放不下就折行),点任意操作后自动收起(图片平时只有一颗小点) -->

@@ -1,6 +1,6 @@
 {
   "name": "st-yg-image",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "description": "YG 插图师：SillyTavern 剧情配图扩展。提示词可由内置 LLM 分析，也可交给中转站模型编译成 CLIP 提示词",

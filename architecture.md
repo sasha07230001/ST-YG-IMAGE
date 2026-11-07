@@ -55,6 +55,14 @@
    - AI 读取那一跳在 `runner.ts` 的 `readTransientForFloor`:独立一次模型调用,
      **不并进主请求**(并进去模型会把换装写进固定档案),失败只 warn 不影响出图;
    - 公开接口 `generate()` 显式传 `{ generalOnly: true, reload: false }`。
+7.6. **手动提示词生图** —— `src/floor/manualPrompt.ts`(写 tag)+ `ManualPromptDialog.vue`
+   + `manualPromptDialog.ts`(命令式挂载)+ `actionButton.ts`(楼层钢笔按钮)。
+   - 复用「正文里有一条 tag」这条既有通道,不另开出图路径(卡片/灯箱/图库/重绘/闸门全绑在它上面);
+   - 新 tag **追加在末尾**,序号 = 落盘那一刻现算的 tag 数(在 `applyMessageText` 的 buildNext 里算,
+     不是请求开始时的快照 —— 期间别的插件插了 tag 也不会撞号);
+   - 不碰角色档案;`saveImageResult` 记 `origin: 'manual'`,卡片显示「手动提示词」角标;
+   - 直接出图靠 `markForAutoGenerate(..., 'force')` + 再水合一次,复用卡片既有的自动开跑逻辑;
+   - 失败一律回填弹窗错误并解锁按钮(否则一次失败就再也点不动)。
 8. **自动更新默认关闭**(`src/update.ts` 的 `UPDATE_CHECK_ENABLED = false`):
    上游 manifest 与本插件版本无关联,照旧去拉会得到一个永远「有更新」且会把上游整包
    覆盖过来的红点。放到自己的仓库后改掉地址再打开。

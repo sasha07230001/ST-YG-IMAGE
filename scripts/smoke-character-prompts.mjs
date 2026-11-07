@@ -222,6 +222,36 @@ try {
   log('临时开关', pageText.includes('每楼让模型读取当前装扮'));
   log('预览行', pageText.includes('追加到 CLIP 的内容'));
 
+  /* —— 手动提示词生图:楼层按钮 + 弹窗 —— */
+  // 楼层按钮注入在 #chat 里;冒烟没建 .mes 节点,这里补一个最小楼层验证注入与点击
+  const mes = document.createElement('div');
+  mes.className = 'mes';
+  mes.setAttribute('mesid', '1');
+  mes.innerHTML = '<div class="mes_text">她转身。</div><div class="extraMesButtons"></div>';
+  document.getElementById('chat').appendChild(mes);
+
+  // 等 #chat 观察器的 rAF 节流跑一轮(它负责把按钮补上)
+  await wait(400);
+  const manualBtn = mes.querySelector('.bbi-manual-action');
+  log('手动生图按钮已注入', !!manualBtn);
+  log('生成 tag 按钮仍在', !!mes.querySelector('.bbi-tag-action'));
+
+  if (manualBtn) {
+    manualBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    await wait(400);
+    const dialogText = (shadow.textContent ?? '').replace(/\s+/g, ' ');
+    log('弹窗已打开', dialogText.includes('手动提示词生图'));
+    log('弹窗说明区分了三者', dialogText.includes('追加到本楼末尾'));
+    log('主按钮为生成图片', dialogText.includes('生成图片'));
+
+    // 空提示词点提交:应被本地校验拦住,不该写正文
+    const before = ctx.chat[1].mes;
+    const primary = [...shadow.querySelectorAll('button')].find((b) => (b.textContent ?? '').trim() === '生成图片');
+    primary?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    await wait(200);
+    log('空提示词被拦下(未写正文)', ctx.chat[1].mes === before);
+  }
+
   const failed = results.filter((ok) => !ok).length;
   if (failed) {
     console.log('\n✗ 有断言失败');

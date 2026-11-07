@@ -1,18 +1,20 @@
 import { requestFloorTags } from '@/autoTag/runner';
 import { confirmDialog } from '@/components/confirm';
 import { ensureChatObserver, onChatMutation } from '@/floor/chatObserver';
+import { openManualPromptDialog } from '@/floor/manualPromptDialog';
 import { isCurrentChatExcluded, settings } from '@/state/settings';
 import { getContext, isAiStoryMessage } from '@/st/context';
 import { hasImageTagTrace } from '@/st/imageTagRegex';
 
 /**
- * 楼层「生成生图 tag」按钮注入。
+ * 楼层「生成生图 tag」按钮 + 「手动提示词生图」按钮注入。
  *
- * 每个剧情楼的 .extraMesButtons(ST 扩展按钮区,"⋯" 展开)追加一个调色板按钮
- * (与扩展菜单入口同款图标):
- * - 无 tag 的楼:直接分析并写入 tag;
- * - 已有 tag 的楼:先弹插件自绘确认窗,确认后剔除旧 tag、重新分析写入
- *   (旧图片保留在卡片历史里,新 tag 的卡片按 stale 机制展示旧图)。
+ * 每个剧情楼的 .extraMesButtons(ST 扩展按钮区,"⋯" 展开)追加两枚调色板系按钮:
+ * - 调色板(bbi-tag-action):无 tag 的楼直接分析并写入 tag;已有 tag 的楼先弹插件自绘
+ *   确认窗,确认后剔除旧 tag、重新分析写入(旧图片保留在卡片历史里);
+ * - 手写板(bbi-manual-action):打开「手动提示词生图」弹窗 —— 自己敲提示词,
+ *   写完往本楼末尾追加一条新 tag 并直接出图。**不经过模型**,也不改已有 tag
+ *   (分工见 floor/manualPrompt.ts 文件头的三方对照表)。
  *
  * 给谁不给谁**只由 st/context.ts 的 isAiStoryMessage 说话**,与自动流程、与 runner
  * 的兜底闸门是同一个谓词:AI 楼给、用户楼与 ST 真系统楼不给,而被 /hide 隐藏的普通楼
@@ -26,8 +28,11 @@ import { hasImageTagTrace } from '@/st/imageTagRegex';
  */
 
 const BUTTON_CLASS = 'bbi-tag-action';
+const MANUAL_CLASS = 'bbi-manual-action';
 // 与扩展菜单入口同款调色板图标
 const ICON_CLASS = 'fa-palette';
+// 手写板:钢笔尖图标,与「生成 tag」的调色板区分开(两者的产出完全不同)
+const MANUAL_ICON_CLASS = 'fa-pen-nib';
 
 let bound = false;
 
@@ -93,6 +98,48 @@ function createButton(): HTMLDivElement {
 }
 
 /**
+ * 手动提示词生图的按钮。与「生成 tag」并列放在 .extraMesButtons 里,
+ * 排序紧随其后(append 在同一处,天然相邻)。
+ *
+ * 与 onActivate 同一条纪律:**点了必须有下文**——找不到楼层、插件停用都要 toast,
+ * 静默 return 在用户那里就是「点了没反应」。
+ */
+function onManualActivate(button: HTMLElement): void {
+  const floor = Number(button.closest('.mes')?.getAttribute('mesid'));
+  const context = getContext();
+  if (!context || !Number.isInteger(floor) || !context.chat?.[floor]) {
+    console.warn('[YG] 手动提示词按钮找不到对应消息', {
+      mesid: button.closest('.mes')?.getAttribute('mesid'),
+    });
+    toastr.warning('找不到这一楼的消息，请刷新页面后重试', 'YG 插图师');
+    return;
+  }
+  if (!settings.enabled) {
+    toastr.warning('YG已停用，请先在插件设置里开启', 'YG 插图师');
+    return;
+  }
+  openManualPromptDialog({ floor });
+}
+
+function createManualButton(): HTMLDivElement {
+  const button = document.createElement('div');
+  button.className = `mes_button fa-solid ${MANUAL_ICON_CLASS} ${MANUAL_CLASS}`;
+  button.title = '手动提示词生图（自己写提示词，新增一张图）';
+  button.setAttribute('role', 'button');
+  button.setAttribute('tabindex', '0');
+
+  const activate = () => onManualActivate(button);
+  button.addEventListener('click', activate);
+  button.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      activate();
+    }
+  });
+  return button;
+}
+
+/**
  * 按钮与「谁该有按钮」对账(幂等、双向):该有的补,该撤的撤。
  *
  * 双向是必需的——只补不撤时,判据变了(排除名单里加了这个角色、/role 把楼改成系统楼)
@@ -113,8 +160,12 @@ function syncButtons(): void {
     // 顺带的好处:/hide 只翻属性、不动 DOM 树,本来就触发不了 observer,现在也无需触发。
     const wanted = !excluded && Number.isInteger(floor) && isAiStoryMessage(chat[floor]);
     const existing = extra.querySelector<HTMLElement>(`.${BUTTON_CLASS}`);
+    const existingManual = extra.querySelector<HTMLElement>(`.${MANUAL_CLASS}`);
     if (wanted && !existing) extra.appendChild(createButton());
     else if (!wanted && existing && existing.dataset.running !== '1') existing.remove();
+    // 手动按钮没有在途态(提交后立刻关窗、图由卡片显示),判据与主按钮同源
+    if (wanted && !existingManual) extra.appendChild(createManualButton());
+    else if (!wanted && existingManual) existingManual.remove();
   }
 }
 
