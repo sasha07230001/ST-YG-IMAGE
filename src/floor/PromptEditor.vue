@@ -6,7 +6,8 @@ import type { Orientation } from '@/backends/size';
 import BbiTextarea from '@/components/BbiTextarea.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
-import { activeOrientationLock } from '@/state/settings';
+import PromptSendPreview from '@/components/PromptSendPreview.vue';
+import { activeComfyPreset, activeOrientationLock } from '@/state/settings';
 import { containsTagMarkup, type ImageTagContent } from '@/st/imageTagRegex';
 
 /**
@@ -152,6 +153,21 @@ const error = computed(() => {
 });
 
 const canApply = computed(() => !error.value && !props.busy && !props.rewriting);
+
+/* —— 发送预览:取当前渠道的口径,让弹窗里看到的与真发出去的一致 —— */
+const comfyPreset = computed(() => activeComfyPreset());
+const comfyMode = computed<'custom' | 'simple'>(() =>
+  comfyPreset.value.mode === 'simple' ? 'simple' : 'custom',
+);
+const comfySimple = computed(() => comfyPreset.value.simple);
+const comfyFixed = computed(() => comfyPreset.value.simple.positive ?? '');
+/** 固定负面 + 本画面负面:两者在发送时是叠加的,预览里合起来才是真值。 */
+const comboNegative = computed(() =>
+  [comfyPreset.value.simple.negative ?? '', draft.value.negative]
+    .map(part => part.trim())
+    .filter(Boolean)
+    .join(', '),
+);
 
 /**
  * AI 重写落盘后,把新提示词读回输入框。
@@ -351,7 +367,7 @@ onBeforeUnmount(() => {
 
       <div class="bbi-modal-field">
         <span class="bbi-modal-label">
-          角色提示词(多角色;仅 NAI 后端发送)
+          角色提示词(多角色;NAI 走原生 character prompts,ComfyUI 简易模式走分层拼接)
         </span>
         <div v-for="(character, index) in characters" :key="index" class="bbi-char-row">
           <input
@@ -386,6 +402,21 @@ onBeforeUnmount(() => {
         </button>
         <span class="bbi-field-hint">角色名与 tag 都填了才会生效,留空的行保存时自动丢弃。</span>
       </div>
+
+      <!-- 发送预览:把「这一张真会送进 ComfyUI 正面框的那一串」摊开。
+           稿子里三个来源(渠道固定正面 / 角色行 / 本楼 tag)平时分散在三个地方,
+           用户想确认「有没有被去重、有没有被预算砍」只能真跑一次出图去猜,故放在保存按钮之前。 -->
+      <PromptSendPreview
+        :config="comfySimple"
+        :mode="comfyMode"
+        :fixed="comfyFixed"
+        :story="draft.tag"
+        :story-nl="draft.nl"
+        :characters="draft.characters"
+        :negative="comboNegative"
+        title="这一次会发出去的"
+        compact
+      />
 
       <!-- 改提示词会换 promptHash 桶,而 stale 态只显示最新一张、翻页器不出现。
            这是既有存储设计,但手动改提示词会让它从边角情况变成日常,故明确告知。 -->

@@ -26,6 +26,7 @@ import Collapsible from '@/components/Collapsible.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
+import PromptSendPreview from '@/components/PromptSendPreview.vue';
 import {
   activeComfyPreset,
   effectiveComfyConn,
@@ -46,6 +47,27 @@ const confirmDeleteOpen = ref(false);
 
 /** 本渠道是否为当前出图渠道;「使用此渠道」按钮与设置页选择器、页签徽标同属一个开关。 */
 const inUse = computed(() => settings.defaultBackend === 'comfyui');
+
+/* ============ 分层拼接 ============ */
+
+/**
+ * 层间连接符的可选项。**值里带空格与换行,不能写成模板字面量**:
+ * Vue 模板会把属性值里的换行折掉,`&#10;` 实体在这里是唯一可靠的写法。
+ */
+const LAYER_SEPARATOR_OPTIONS = [
+  { value: ', ', label: '逗号 + 空格　,' },
+  { value: '、', label: '顿号　、' },
+  { value: '\n', label: '换行' },
+];
+
+/** 提示词组头上的那一行摘要:让用户不必展开就能看出现在是几层在跑。 */
+const layerSummary = computed(() => {
+  const simple = active.value.simple;
+  if (simple.layered === false) return '旧口径:固定正面 + 剧情(角色不发送)';
+  const budget = simple.tagBudget > 0 ? ` · 预算 ${simple.tagBudget}` : '';
+  const dedupe = simple.dedupeTags === false ? ' · 不去重' : '';
+  return `三层:固定正面 → 角色 → 剧情${budget}${dedupe}`;
+});
 
 /* ============ 工作流库 ============ */
 
@@ -689,6 +711,7 @@ function applyAssist() {
           <section class="wf-group">
             <div class="wf-group-head">
               <span class="bbi-field-label">提示词</span>
+              <span class="wf-layer-summary">{{ layerSummary }}</span>
             </div>
             <div class="wf-prompts">
               <BbiTextarea
@@ -705,6 +728,73 @@ function applyAssist() {
                 placeholder="固定负面:通用负面词;AI 生成的动态负面追加在后"
               />
             </div>
+          </section>
+
+          <!-- 分层拼接:决定「固定正面 / 角色 / 剧情」三段的插入位次与合并规则。
+               顺序恒为 固定正面 → 角色 → 剧情(见 backends/promptLayers.ts 的 LAYER_ORDER),
+               这里只放开三个会改变成品的旋钮:连接符、去重、预算。 -->
+          <section class="wf-group">
+            <div class="wf-group-head">
+              <span class="bbi-field-label">分层拼接</span>
+            </div>
+            <label class="wf-switch">
+              <input v-model="active.simple.layered" type="checkbox" class="bbi-checkbox" />
+              <span>按「固定正面 → 角色 → 剧情」三层拼接后写入 CLIP</span>
+            </label>
+            <p class="wf-layer-hint">
+              关掉 = 旧口径:只发「固定正面 + 剧情」,角色提示词不进 CLIP。
+              开启后角色层的来源是「角色管理」页的固定外貌库 + 当楼临时提示词。
+            </p>
+            <div class="wf-params" :class="{ 'is-off': !active.simple.layered }">
+              <label class="wf-param">
+                <span>层间连接符</span>
+                <BbiSelect
+                  v-model="active.simple.layerSeparator"
+                  :options="LAYER_SEPARATOR_OPTIONS"
+                  aria-label="层间连接符"
+                />
+              </label>
+              <label class="wf-param">
+                <span>tag 预算</span>
+                <input
+                  v-model.number="active.simple.tagBudget"
+                  class="bbi-input"
+                  type="number"
+                  min="0"
+                  max="400"
+                  step="5"
+                />
+              </label>
+            </div>
+            <p class="wf-layer-hint">
+              tag 预算 0 = 不限;超了从末层末尾往前砍,固定正面永远保得住。
+            </p>
+            <label class="wf-switch" :class="{ 'is-off': !active.simple.layered }">
+              <input v-model="active.simple.dedupeTags" type="checkbox" class="bbi-checkbox" />
+              <span>跨层去重(保先出现的那层)</span>
+            </label>
+            <p class="wf-layer-hint">
+              <code>(silver hair:1.2)</code> 与 <code>silver_hair</code> 会被认成同一个词,
+              固定正面写过的就不再重复。
+            </p>
+          </section>
+
+          <!-- 发送预览:改动旋钮的同时看着成品串变,不用真跑一次出图去猜。 -->
+          <section class="wf-group">
+            <div class="wf-group-head">
+              <span class="bbi-field-label">发送预览</span>
+            </div>
+            <PromptSendPreview
+              :config="active.simple"
+              mode="simple"
+              :fixed="active.simple.positive"
+              story="1girl, standing in the rain(出图时由 AI 按本楼正文编译)"
+              :negative="active.simple.negative"
+              compact
+            />
+            <p class="wf-layer-hint">
+              剧情层这里是示例串;想看真实一楼的完整三层,到「发送预览」页用草稿试。
+            </p>
           </section>
 
         </template>
@@ -946,6 +1036,48 @@ function applyAssist() {
 .wf-prompts {
   display: grid;
   gap: 8px;
+}
+/* 提示词组头右侧的分层摘要:常驻一行,窄屏先收缩后换行,不挤掉左边的「提示词」 */
+.wf-layer-summary {
+  font-size: 11.5px;
+  color: var(--bbi-ink-soft);
+  text-align: right;
+  min-width: 0;
+}
+/* 分层拼接的开关行:文案较长,故与 .bbi-switch-row 不同——标签在左可换行,勾选框钉在右 */
+.wf-switch {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--bbi-ink);
+  cursor: pointer;
+}
+.wf-switch .bbi-checkbox {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+.wf-switch.is-off {
+  opacity: 0.55;
+}
+/* 分层关闭时下方参数仍可编辑(用户可能在关着的时候先配好再开),只压暗不 disable */
+.wf-params.is-off {
+  opacity: 0.55;
+}
+.wf-layer-hint {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--bbi-ink-soft);
+}
+.wf-layer-hint code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--bbi-surface-2);
+  font-family: var(--bbi-font-mono, ui-monospace, monospace);
+  font-size: 11px;
 }
 @media (max-width: 640px) {
   .wf-params {

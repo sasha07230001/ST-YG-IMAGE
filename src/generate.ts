@@ -209,8 +209,16 @@ export async function generateImage(
 
   const isNai = status.backend === 'nai';
   const characters = input.characters ?? [];
-  // 支持与否由后端说了算:ComfyUI 恒不支持;NAI 看模型是否 4.5/V5
-  const charactersApplied = characters.length > 0 && status.supportsCharacters;
+  /**
+   * 简易模式 + 分层开启时,角色提示词不再由后端静默丢弃,而是作为「角色层」
+   * 拼进正面提示词(见 backends/promptLayers.ts),这条也算 charactersApplied。
+   * custom 模式没有角色位(工作流里只有 %prompt%),分层开了也不该谎报。
+   */
+  const comfyConn = isNai ? null : effectiveComfyConn();
+  const comfyLayered =
+    comfyConn !== null && comfyConn.mode === 'simple' && comfyConn.simple.layered !== false;
+  // 支持与否由后端说了算:NAI 看模型是否 4.5/V5;ComfyUI 看是否简易模式 + 分层开启
+  const charactersApplied = characters.length > 0 && (status.supportsCharacters || comfyLayered);
 
   /**
    * 角色档案提示词(常驻 + 临时)——**在这里追加,不是在各后端里**。
@@ -260,7 +268,7 @@ export async function generateImage(
       result = output.result;
       meta = { backend: 'nai', model: status.model, ...output.usage };
     } else {
-      const conn = effectiveComfyConn();
+      const conn = comfyConn ?? effectiveComfyConn();
       result = await generateComfyImage(
         conn,
         {
@@ -269,6 +277,9 @@ export async function generateImage(
           negative_prompt: input.negative ?? '',
           seed: input.seed,
           size,
+          // 只有分层开启时才把角色层交给后端;关掉就回到 0.5.0 旧口径(角色不进 CLIP)
+          characters: comfyLayered ? characters : undefined,
+          characterTag: comfyLayered ? archive.text : undefined,
         },
         signal,
         { onQueue: ahead => progress.onQueue?.(ahead) },
@@ -282,6 +293,8 @@ export async function generateImage(
         prompt,
         nl,
         negative: input.negative,
+        characters: comfyLayered ? characters : undefined,
+        characterTag: comfyLayered ? archive.text : undefined,
         seed: input.seed,
         width,
         height,

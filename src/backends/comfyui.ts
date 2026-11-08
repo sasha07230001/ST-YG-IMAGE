@@ -1,5 +1,6 @@
 import { buildSimpleWorkflow } from '@/backends/comfyTemplates';
 import { parseSize, pickSize, type Orientation } from '@/backends/size';
+import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import { getContext } from '@/st/context';
 import { type ComfyRunConn } from '@/state/settings';
 
@@ -17,6 +18,13 @@ export interface ComfyTemplateValues {
   height?: number;
   /** 画幅方向;generateComfyImage 据此从渠道配置解析出 width/height。 */
   size?: Orientation;
+  /**
+   * 角色层(简易模式 + 分层开启时由 composePositive 拼进正向)。
+   * custom 模式没有角色位,传进来也不会用。
+   */
+  characters?: ImageCharacterPrompt[];
+  /** 已合成的角色档案串(常驻 + 临时),与 characters 一起构成角色层。 */
+  characterTag?: string;
 }
 
 export interface ComfyImageResult {
@@ -590,6 +598,8 @@ export async function generateComfyImage(
         prompt: values.prompt,
         nl: values.nl,
         negative: values.negative_prompt,
+        characters: values.characters,
+        characterTag: values.characterTag,
         seed: values.seed ?? randomSeed(),
         width: size?.width ?? 0,
         height: size?.height ?? 0,

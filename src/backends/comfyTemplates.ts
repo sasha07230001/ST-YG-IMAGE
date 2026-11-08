@@ -15,6 +15,14 @@
  * 由 comfyui.ts 包成 ComfyUIError。
  */
 
+import type { ImageCharacterPrompt } from '@/autoTag/protocol';
+import {
+  buildPromptLayers,
+  composeLayeredPrompt,
+  DEFAULT_SEPARATOR,
+  type PromptLayerOptions,
+  type PromptLayersResult,
+} from '@/backends/promptLayers';
 import type { GenerationParams } from '@/generationMeta';
 
 /** 节点引用:[节点 id, 输出槽位]。 */
@@ -68,6 +76,19 @@ export interface ComfySimpleConfig {
   positive: string;
   /** 固定负面,AI 动态负面追加在后。 */
   negative: string;
+  /**
+   * 是否按「固定正面 → 角色 → 剧情」三层拼接正向提示词。
+   *
+   * 关掉 = 回到 0.5.0 的旧口径:固定正面 + (自然语言优先,否则 tag),角色层不进 CLIP。
+   * 默认开 —— 老配置没有这个键时 normalize 落成 true,行为升级但不破坏可回退性。
+   */
+  layered: boolean;
+  /** 层间连接符。 */
+  layerSeparator: string;
+  /** 是否跨层去重(按归一后的 tag 比)。 */
+  dedupeTags: boolean;
+  /** tag 数上限,0 = 不限;超了从末层末尾开始砍。 */
+  tagBudget: number;
 }
 
 export interface ComfyTemplateMeta {
@@ -177,6 +198,10 @@ export function simpleDefaults(template: ComfySimpleTemplateId = 'checkpoint'): 
     shift: meta.defaults.shift,
     positive: '',
     negative: '',
+    layered: true,
+    layerSeparator: DEFAULT_SEPARATOR,
+    dedupeTags: true,
+    tagBudget: 0,
   };
 }
 
@@ -215,6 +240,10 @@ export function normalizeSimpleConfig(raw: unknown): ComfySimpleConfig {
     shift: asNumber(o.shift, base.shift),
     positive: asText(o.positive),
     negative: asText(o.negative),
+    layered: o.layered !== false,
+    layerSeparator: asText(o.layerSeparator) || DEFAULT_SEPARATOR,
+    dedupeTags: o.dedupeTags !== false,
+    tagBudget: Math.max(0, Math.round(asNumber(o.tagBudget, 0))),
   };
 }
 
@@ -240,6 +269,16 @@ export interface SimpleGenValues {
   nl?: string;
   /** AI 生成的动态负面 tag。 */
   negative?: string;
+  /**
+   * 本张画面的多角色提示。NAI 4.5/V5 走原生 character prompts;
+   * 分层开启时,ComfyUI 走「角色层」拼进正向提示词(见 promptLayers.ts)。
+   */
+  characters?: ImageCharacterPrompt[];
+  /**
+   * 已合成的角色档案串(常驻 + 临时,由 autoTag/characterPrompts 产出)。
+   * 分层开启时并入角色层;关掉分层时**不进 CLIP**(与 0.5.0 旧口径一致)。
+   */
+  characterTag?: string;
   seed: number;
   width: number;
   height: number;
@@ -251,11 +290,61 @@ function joinParts(...parts: (string | undefined)[]): string {
 }
 
 /**
- * 正向 = 固定正面 + 生成内容;生成内容有 nl 优先用 nl(Flux/Anima 吃自然语言),
- * 没有才退回短 tag。开关在预设上,用户自己决定模板与开关的搭配。
+ * 分层开关 → 拼接选项。UI 与后端共用同一份换算,避免面板显示的分隔符
+ * 与真正发出去的串不一致。
+ */
+export function layerOptionsOf(simple: ComfySimpleConfig): PromptLayerOptions {
+  return {
+    separator: simple.layerSeparator || DEFAULT_SEPARATOR,
+    dedupe: simple.dedupeTags !== false,
+    budget: simple.tagBudget,
+  };
+}
+
+/**
+ * 正向提示词。
+ *
+ * 分层开启(默认):固定正面 → 角色 → 剧情。三层由 promptLayers.ts 统一拼,
+ * 角色层吃 characters[](结构化多角色)与 characterTag(已合成档案串)。
+ *
+ * 分层关闭:回到 0.5.0 旧口径 —— 固定正面 + (自然语言优先,否则 tag),
+ * **角色层不发送**,这样用户可以随时切回去对比。
  */
 export function composePositive(simple: ComfySimpleConfig, values: SimpleGenValues): string {
-  return joinParts(simple.positive, (values.nl ?? '').trim() || values.prompt);
+  if (simple.layered === false) {
+    return joinParts(simple.positive, (values.nl ?? '').trim() || values.prompt);
+  }
+  return composeLayeredPrompt(
+    {
+      fixed: simple.positive,
+      characters: values.characters,
+      characterTag: values.characterTag,
+      story: values.prompt,
+      storyNl: values.nl,
+    },
+    layerOptionsOf(simple),
+  );
+}
+
+/** 分层明细(UI 预览与随图记录用;与 composePositive 同一份实现)。 */
+export function composePositiveLayers(
+  simple: ComfySimpleConfig,
+  values: SimpleGenValues,
+): PromptLayersResult {
+  if (simple.layered === false) {
+    const text = joinParts(simple.positive, (values.nl ?? '').trim() || values.prompt);
+    return buildPromptLayers({ fixed: text }, { separator: DEFAULT_SEPARATOR, dedupe: false });
+  }
+  return buildPromptLayers(
+    {
+      fixed: simple.positive,
+      characters: values.characters,
+      characterTag: values.characterTag,
+      story: values.prompt,
+      storyNl: values.nl,
+    },
+    layerOptionsOf(simple),
+  );
 }
 
 /** 负面 = 固定负面 + AI 动态负面追加。 */
