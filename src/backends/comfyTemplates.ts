@@ -20,6 +20,9 @@ import {
   buildPromptLayers,
   composeLayeredPrompt,
   DEFAULT_SEPARATOR,
+  LAYER_ORDER,
+  normalizeLayerOrder,
+  type PromptLayerId,
   type PromptLayerOptions,
   type PromptLayersResult,
 } from '@/backends/promptLayers';
@@ -89,6 +92,13 @@ export interface ComfySimpleConfig {
   dedupeTags: boolean;
   /** tag 数上限,0 = 不限;超了从末层末尾开始砍。 */
   tagBudget: number;
+  /**
+   * 三层的实际拼接顺序。默认 `LAYER_ORDER`(固定正面 → 角色 → 剧情)。
+   *
+   * 拖动层的排序存在这里而不是存全局:同一台 ComfyUI 上跑两个预设时,
+   * 「Anima 要剧情优先、SDXL 要画风优先」是常态,顺序跟着预设走才对。
+   */
+  layerOrder: PromptLayerId[];
 }
 
 export interface ComfyTemplateMeta {
@@ -202,6 +212,7 @@ export function simpleDefaults(template: ComfySimpleTemplateId = 'checkpoint'): 
     layerSeparator: DEFAULT_SEPARATOR,
     dedupeTags: true,
     tagBudget: 0,
+    layerOrder: [...LAYER_ORDER],
   };
 }
 
@@ -244,6 +255,7 @@ export function normalizeSimpleConfig(raw: unknown): ComfySimpleConfig {
     layerSeparator: asText(o.layerSeparator) || DEFAULT_SEPARATOR,
     dedupeTags: o.dedupeTags !== false,
     tagBudget: Math.max(0, Math.round(asNumber(o.tagBudget, 0))),
+    layerOrder: normalizeLayerOrder(o.layerOrder),
   };
 }
 
@@ -298,6 +310,7 @@ export function layerOptionsOf(simple: ComfySimpleConfig): PromptLayerOptions {
     separator: simple.layerSeparator || DEFAULT_SEPARATOR,
     dedupe: simple.dedupeTags !== false,
     budget: simple.tagBudget,
+    order: normalizeLayerOrder(simple.layerOrder),
   };
 }
 

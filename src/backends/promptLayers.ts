@@ -33,10 +33,10 @@
  * 拖进单测与公开接口。
  */
 
-/** 三个层的 id。顺序即拼接顺序,见 LAYER_ORDER。 */
+/** 三个层的 id。顺序即默认拼接顺序,见 LAYER_ORDER。 */
 export type PromptLayerId = 'fixed' | 'character' | 'story';
 
-/** 拼接顺序,也是 UI 上「插入位次」的编号来源。 */
+/** 默认拼接顺序,也是 UI 上「插入位次」的编号来源。用户可在提示词设置里改。 */
 export const LAYER_ORDER: readonly PromptLayerId[] = ['fixed', 'character', 'story'] as const;
 
 /** 每层的显示名(UI 与图注共用一份,别处不要再写死字符串)。 */
@@ -80,7 +80,52 @@ export interface PromptLayerOptions {
   budget?: number;
   /** 剧情层是否优先用自然语言(Flux/Anima 吃自然语言)。 */
   preferNaturalLanguage?: boolean;
+  /**
+   * 拼接顺序。默认 `LAYER_ORDER`(固定正面 → 角色 → 剧情)。
+   *
+   * 用户可以把层拖到别处,但**固定正面在最前**是软约束:CLIP 对越靠前的 token
+   * 越敏感,把画风基线排到末尾等于主动把它送进垃圾桶。UI 拦一下(`pinFixedFirst`),
+   * 坚持要这么排的也放行——用户可能就是想用剧情词压过画风词。
+   *
+   * 非法 id 会被丢掉,缺失的层按默认顺序补在末尾,所以传进来的数组不用自己清洗。
+   */
+  order?: readonly PromptLayerId[];
 }
+
+/**
+ * 清洗顺序数组:白名单过滤 + 去重 + 用默认顺序补齐缺失层(补在末尾)。
+ *
+ * 为什么补齐而不是丢掉:少传一个 `story` 就会让 AI 编译出的画面词凭空消失,
+ * 那是很难查的静默失败;补在末尾至少「看得见」。
+ */
+export function normalizeLayerOrder(raw: unknown): PromptLayerId[] {
+  const out: PromptLayerId[] = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const id = String(item ?? '').trim() as PromptLayerId;
+      if (LAYER_ORDER.includes(id) && !out.includes(id)) out.push(id);
+    }
+  }
+  for (const id of LAYER_ORDER) {
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * 检查固定正面是否排在最前。不满足时给出「挪回最前」的顺序,
+ * 由调用方决定是提示还是直接纠正。
+ */
+export function pinFixedFirst(order: readonly PromptLayerId[]): {
+  order: PromptLayerId[];
+  corrected: boolean;
+} {
+  const clean = normalizeLayerOrder(order);
+  if (clean[0] === 'fixed') return { order: clean, corrected: false };
+  const rest = clean.filter(id => id !== 'fixed');
+  return { order: ['fixed', ...rest], corrected: true };
+}
+
 
 export interface PromptLayer {
   id: PromptLayerId;
@@ -98,7 +143,7 @@ export interface PromptLayer {
 }
 
 export interface PromptLayersResult {
-  /** 三层,恒为 3 条且按 LAYER_ORDER 排;空层的 text 为空串。 */
+  /** 各层,恒为 3 条且按本次实际使用的顺序排;空层的 text 为空串。 */
   layers: PromptLayer[];
   /** 拼好的成品串。 */
   text: string;
@@ -110,6 +155,8 @@ export interface PromptLayersResult {
   droppedByBudget: number;
   /** 同层内重复出现的角色名(只保留第一份)。 */
   duplicateCharacters: string[];
+  /** 本次实际使用的拼接顺序(已清洗)。UI 的拖动回显读它。 */
+  order: PromptLayerId[];
 }
 
 const DEFAULT_SEPARATOR = ', ';
@@ -226,6 +273,8 @@ export function buildPromptLayers(
   const dedupe = options.dedupe !== false;
   const budget = Math.max(0, Math.floor(Number(options.budget) || 0));
   const nlFirst = options.preferNaturalLanguage === true;
+  // 顺序可被用户改;清洗后一定是一个含全部三层的合法排列
+  const order = normalizeLayerOrder(options.order);
 
   const storyText = nlFirst
     ? String(source.storyNl ?? '').trim() || String(source.story ?? '').trim()
@@ -237,11 +286,12 @@ export function buildPromptLayers(
     story: [storyText],
   };
 
-  // 跨层去重:后出现的层让位给先出现的层(fixed 永远赢,story 让 character)
+  // 跨层去重:后出现的层让位给先出现的层。注意「先出现」现在按 order 算,
+  // 把剧情层拖到最前,剧情词就会反过来压住固定正面里的同名词。
   const seen = new Set<string>();
   const kept: Record<PromptLayerId, string[]> = { fixed: [], character: [], story: [] };
   let droppedDuplicates = 0;
-  for (const id of LAYER_ORDER) {
+  for (const id of order) {
     for (const part of rawParts[id]) {
       for (const tag of splitTags(part)) {
         if (dedupe) {
@@ -260,10 +310,10 @@ export function buildPromptLayers(
   // 预算:从末层末尾开始砍
   let droppedByBudget = 0;
   if (budget > 0) {
-    const total = LAYER_ORDER.reduce((sum, id) => sum + kept[id].length, 0);
+    const total = order.reduce((sum, id) => sum + kept[id].length, 0);
     let excess = total - budget;
-    for (let i = LAYER_ORDER.length - 1; i >= 0 && excess > 0; i -= 1) {
-      const list = kept[LAYER_ORDER[i]];
+    for (let i = order.length - 1; i >= 0 && excess > 0; i -= 1) {
+      const list = kept[order[i]];
       while (excess > 0 && list.length > 0) {
         list.pop();
         excess -= 1;
@@ -272,7 +322,7 @@ export function buildPromptLayers(
     }
   }
 
-  const layers: PromptLayer[] = LAYER_ORDER.map(id => {
+  const layers: PromptLayer[] = order.map(id => {
     const tags = kept[id];
     const text = tags.join(separator);
     const rawCount = rawParts[id].reduce((sum, part) => sum + splitTags(part).length, 0);
@@ -304,6 +354,7 @@ export function buildPromptLayers(
     droppedDuplicates,
     droppedByBudget,
     duplicateCharacters: duplicateCharacterNames(source),
+    order,
   };
 }
 

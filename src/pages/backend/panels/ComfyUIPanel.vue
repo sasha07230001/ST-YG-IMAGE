@@ -15,6 +15,12 @@ import {
 } from '@/backends/comfyObjectInfo';
 import { getWorkflowPlaceholders, testComfyConnection } from '@/backends/comfyui';
 import {
+  LAYER_LABELS,
+  LAYER_ORDER,
+  normalizeLayerOrder,
+  type PromptLayerId,
+} from '@/backends/promptLayers';
+import {
   configureWorkflowWithAi,
   type WorkflowAssistResult,
   type WorkflowBindingPurpose,
@@ -60,19 +66,73 @@ const LAYER_SEPARATOR_OPTIONS = [
   { value: '\n', label: '换行' },
 ];
 
-/** 提示词组头上的那一行摘要:让用户不必展开就能看出现在是几层在跑。 */
+/** 当前预设。settings 是 reactive,直接把它的字段绑 v-model 即可就地编辑。 */
+const active = computed(() => activeComfyPreset());
+
+/** 提示词组头上的那一行摘要:让用户不必展开就能看出现在是几层在跑、按什么顺序。 */
 const layerSummary = computed(() => {
   const simple = active.value.simple;
   if (simple.layered === false) return '旧口径:固定正面 + 剧情(角色不发送)';
   const budget = simple.tagBudget > 0 ? ` · 预算 ${simple.tagBudget}` : '';
   const dedupe = simple.dedupeTags === false ? ' · 不去重' : '';
-  return `三层:固定正面 → 角色 → 剧情${budget}${dedupe}`;
+  const order = normalizeLayerOrder(simple.layerOrder)
+    .map(id => LAYER_LABELS[id])
+    .join(' → ');
+  return `三层:${order}${budget}${dedupe}`;
 });
 
-/* ============ 工作流库 ============ */
+/** 层顺序的本地读写口;拖拽只改这个预设自己的 simple.layerOrder。 */
+const layerOrder = computed<PromptLayerId[]>({
+  get: () => normalizeLayerOrder(active.value.simple.layerOrder),
+  set: value => {
+    active.value.simple.layerOrder = normalizeLayerOrder(value);
+  },
+});
 
-/** 当前预设。settings 是 reactive,直接把它的字段绑 v-model 即可就地编辑。 */
-const active = computed(() => activeComfyPreset());
+/** 拖拽中的层 / 悬停目标。 */
+const dragLayer = ref<PromptLayerId | null>(null);
+const overLayer = ref<PromptLayerId | null>(null);
+
+function onLayerDragStart(id: PromptLayerId, event: DragEvent) {
+  dragLayer.value = id;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', id);
+  }
+}
+
+function onLayerDragOver(id: PromptLayerId, event: DragEvent) {
+  if (!dragLayer.value) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  overLayer.value = id;
+}
+
+/** 松手:插到目标层的位置上(插入位移,不是交换)。 */
+function onLayerDrop(target: PromptLayerId) {
+  const from = dragLayer.value;
+  dragLayer.value = null;
+  overLayer.value = null;
+  if (!from || from === target) return;
+  const next = layerOrder.value.filter(id => id !== from);
+  const at = next.indexOf(target);
+  next.splice(at < 0 ? next.length : at, 0, from);
+  layerOrder.value = next;
+}
+
+function onLayerDragEnd() {
+  dragLayer.value = null;
+  overLayer.value = null;
+}
+
+function resetLayerOrder() {
+  layerOrder.value = [...LAYER_ORDER];
+}
+
+/** 固定正面被拖离首位时的提醒;不硬拦,只提示。 */
+const fixedNotFirst = computed(() => layerOrder.value[0] !== 'fixed');
+
+/* ============ 工作流库 ============ */
 
 const workflowOptions = computed(() =>
   settings.comfyui.workflows.map(w => ({ value: w.id, label: w.name || '未命名工作流' })),
@@ -731,20 +791,57 @@ function applyAssist() {
           </section>
 
           <!-- 分层拼接:决定「固定正面 / 角色 / 剧情」三段的插入位次与合并规则。
-               顺序恒为 固定正面 → 角色 → 剧情(见 backends/promptLayers.ts 的 LAYER_ORDER),
-               这里只放开三个会改变成品的旋钮:连接符、去重、预算。 -->
+               默认顺序是 固定正面 → 角色 → 剧情(见 backends/promptLayers.ts 的 LAYER_ORDER),
+               顺序可拖动;连带着去重的赢家和预算被砍的层一起变。 -->
           <section class="wf-group">
             <div class="wf-group-head">
               <span class="bbi-field-label">分层拼接</span>
+              <span class="wf-group-tools">
+                <button
+                  class="bbi-btn bbi-btn-sm"
+                  type="button"
+                  title="恢复默认顺序:固定正面 → 角色 → 剧情"
+                  @click="resetLayerOrder"
+                >
+                  恢复默认顺序
+                </button>
+              </span>
             </div>
             <label class="wf-switch">
               <input v-model="active.simple.layered" type="checkbox" class="bbi-checkbox" />
-              <span>按「固定正面 → 角色 → 剧情」三层拼接后写入 CLIP</span>
+              <span>三层拼接后写入 CLIP(顺序见下方,可拖动)</span>
             </label>
             <p class="wf-layer-hint">
               关掉 = 旧口径:只发「固定正面 + 剧情」,角色提示词不进 CLIP。
               开启后角色层的来源是「角色管理」页的固定外貌库 + 当楼临时提示词。
             </p>
+
+            <ol class="wf-layer-order" :class="{ 'is-off': !active.simple.layered }">
+              <li
+                v-for="id in layerOrder"
+                :key="id"
+                class="wf-layer-item"
+                :class="{
+                  'is-dragging': dragLayer === id,
+                  'is-over': overLayer === id && dragLayer !== id,
+                  'is-first': id === 'fixed',
+                }"
+                draggable="true"
+                @dragstart="onLayerDragStart(id, $event)"
+                @dragover="onLayerDragOver(id, $event)"
+                @dragleave="overLayer = null"
+                @drop.prevent="onLayerDrop(id)"
+                @dragend="onLayerDragEnd"
+              >
+                <span class="wf-layer-grip" aria-hidden="true">⋮⋮</span>
+                <span class="wf-layer-num">{{ layerOrder.indexOf(id) + 1 }}</span>
+                <span class="wf-layer-name">{{ LAYER_LABELS[id] }}</span>
+              </li>
+            </ol>
+            <p v-if="fixedNotFirst" class="wf-layer-hint wf-layer-warn">
+              固定正面已不在最前。CLIP 对越靠前的 token 越敏感,画风词排到后面可能吃不到权重。
+            </p>
+
             <div class="wf-params" :class="{ 'is-off': !active.simple.layered }">
               <label class="wf-param">
                 <span>层间连接符</span>
@@ -767,7 +864,7 @@ function applyAssist() {
               </label>
             </div>
             <p class="wf-layer-hint">
-              tag 预算 0 = 不限;超了从末层末尾往前砍,固定正面永远保得住。
+              tag 预算 0 = 不限;超了从**末层**末尾往前砍,所以改顺序会改变被砍的是哪一层。
             </p>
             <label class="wf-switch" :class="{ 'is-off': !active.simple.layered }">
               <input v-model="active.simple.dedupeTags" type="checkbox" class="bbi-checkbox" />
@@ -775,7 +872,7 @@ function applyAssist() {
             </label>
             <p class="wf-layer-hint">
               <code>(silver hair:1.2)</code> 与 <code>silver_hair</code> 会被认成同一个词,
-              固定正面写过的就不再重复。
+              顺序在前的层先占位,后面的同名词被吸收。
             </p>
           </section>
 
@@ -1078,6 +1175,62 @@ function applyAssist() {
   background: var(--bbi-surface-2);
   font-family: var(--bbi-font-mono, ui-monospace, monospace);
   font-size: 11px;
+}
+.wf-layer-hint.wf-layer-warn {
+  color: var(--bbi-warn);
+}
+
+/* 层顺序列表:一行一层,拖动改插入位次 */
+.wf-layer-order {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+  transition: opacity 0.15s ease;
+}
+.wf-layer-order.is-off {
+  opacity: 0.45;
+}
+.wf-layer-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-sm, 6px);
+  background: var(--bbi-surface-2);
+  cursor: grab;
+  user-select: none;
+  font-size: 12px;
+}
+.wf-layer-item:active {
+  cursor: grabbing;
+}
+.wf-layer-item.is-first {
+  border-color: var(--bbi-accent);
+}
+.wf-layer-item.is-dragging {
+  opacity: 0.45;
+}
+/* 插入位置提示:用内阴影画一条实心上边线,比整行高亮更像「插到这里」 */
+.wf-layer-item.is-over {
+  box-shadow: inset 0 2px 0 var(--bbi-accent);
+}
+.wf-layer-grip {
+  color: var(--bbi-ink-soft);
+  letter-spacing: -2px;
+}
+.wf-layer-num {
+  width: 1.2em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--bbi-ink-soft);
+}
+.wf-layer-name {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 @media (max-width: 640px) {
   .wf-params {

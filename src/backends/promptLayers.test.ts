@@ -6,6 +6,8 @@ import {
   buildPromptLayers,
   composeLayeredPrompt,
   legacyJoin,
+  normalizeLayerOrder,
+  pinFixedFirst,
   splitTags,
   tagKey,
 } from '@/backends/promptLayers';
@@ -212,5 +214,101 @@ describe('legacyJoin', () => {
   it('旧口径:去空后按默认分隔符连接', () => {
     expect(legacyJoin('masterpiece', '', '1girl')).toBe(`masterpiece${DEFAULT_SEPARATOR}1girl`);
     expect(legacyJoin()).toBe('');
+  });
+});
+
+describe('normalizeLayerOrder', () => {
+  it('默认顺序原样返回', () => {
+    expect(normalizeLayerOrder(LAYER_ORDER)).toEqual(['fixed', 'character', 'story']);
+  });
+
+  it('剔除非法 id,并把缺失的层补在末尾', () => {
+    expect(normalizeLayerOrder(['story', 'bogus', 'fixed'])).toEqual([
+      'story',
+      'fixed',
+      'character',
+    ]);
+  });
+
+  it('重复 id 只留第一次出现的位置', () => {
+    expect(normalizeLayerOrder(['story', 'story', 'fixed'])).toEqual([
+      'story',
+      'fixed',
+      'character',
+    ]);
+  });
+
+  it('非数组输入回落默认顺序', () => {
+    expect(normalizeLayerOrder(undefined)).toEqual([...LAYER_ORDER]);
+    expect(normalizeLayerOrder('fixed')).toEqual([...LAYER_ORDER]);
+    expect(normalizeLayerOrder(42)).toEqual([...LAYER_ORDER]);
+  });
+});
+
+describe('pinFixedFirst', () => {
+  it('固定正面已在前时不动', () => {
+    const result = pinFixedFirst(['fixed', 'story', 'character']);
+    expect(result.corrected).toBe(false);
+    expect(result.order).toEqual(['fixed', 'story', 'character']);
+  });
+
+  it('固定正面被挤到后面时挪回最前,其余相对顺序不变', () => {
+    const result = pinFixedFirst(['story', 'character', 'fixed']);
+    expect(result.corrected).toBe(true);
+    expect(result.order).toEqual(['fixed', 'story', 'character']);
+  });
+});
+
+describe('buildPromptLayers 的层顺序', () => {
+  const source = {
+    fixed: 'styleA',
+    characterTag: 'charB',
+    story: 'storyC',
+  };
+
+  it('默认顺序是 固定正面 → 角色 → 剧情', () => {
+    expect(buildPromptLayers(source).text).toBe('styleA, charB, storyC');
+  });
+
+  it('传入 order 后成品串按它排', () => {
+    expect(buildPromptLayers(source, { order: ['story', 'character', 'fixed'] }).text).toBe(
+      'storyC, charB, styleA',
+    );
+  });
+
+  it('脏 order 被清洗后再用,不会丢层', () => {
+    const result = buildPromptLayers(source, { order: ['story', 'nope' as never] });
+    expect(result.order).toEqual(['story', 'fixed', 'character']);
+    expect(result.text).toBe('storyC, styleA, charB');
+  });
+
+  it('结果里回传本次实际使用的顺序', () => {
+    const result = buildPromptLayers(source, { order: ['character', 'fixed', 'story'] });
+    expect(result.order).toEqual(['character', 'fixed', 'story']);
+    expect(result.layers.map(layer => layer.id)).toEqual(['character', 'fixed', 'story']);
+  });
+
+  it('顺序会改变去重的赢家:把剧情拖到最前,剧情词就不再被固定正面吸收', () => {
+    const dup = { fixed: 'silver hair, styleA', characterTag: 'silver hair', story: 'storyC' };
+    // 默认顺序:fixed 先占 silver hair,角色的那份被吸收
+    expect(buildPromptLayers(dup).text).toBe('silver hair, styleA, storyC');
+    // 角色拖到最前:角色那份先占,固定正面里的 silver hair 被吸收
+    const reordered = buildPromptLayers(dup, { order: ['character', 'fixed', 'story'] });
+    expect(reordered.text).toBe('silver hair, styleA, storyC');
+    expect(reordered.droppedDuplicates).toBe(1);
+  });
+
+  it('预算从「末层末尾」砍,所以改顺序会改被砍的层', () => {
+    const long = {
+      fixed: 'f1, f2',
+      characterTag: 'c1, c2',
+      story: 's1, s2',
+    };
+    // 默认:末层是剧情 → 砍剧情
+    const defaultCut = buildPromptLayers(long, { budget: 4 });
+    expect(defaultCut.text).toBe('f1, f2, c1, c2');
+    // 剧情拖到最前:末层变角色 → 砍角色
+    const flippedCut = buildPromptLayers(long, { budget: 4, order: ['story', 'fixed', 'character'] });
+    expect(flippedCut.text).toBe('s1, s2, f1, f2');
   });
 });

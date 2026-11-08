@@ -46,6 +46,18 @@ const props = defineProps<{
 const customMode = computed(() => props.mode === 'custom');
 const layeredOn = computed(() => props.config?.layered !== false);
 
+/**
+ * 预览行:PromptLayer 加「这一层这次到底发不发」。
+ *
+ * 独立成 interface 而不是 `PromptLayer & {...}`:交叉类型在联合推断里会被拆成
+ * 「干净层 | 带 skipped 层」两个成员,`computed<T>` 的泛型对不上就报 TS2769。
+ * 显式命名一个类型,数组元素从构造处就是同一形状。
+ */
+interface PreviewLayer extends PromptLayer {
+  skipped: boolean;
+  reason?: string;
+}
+
 const result = computed(() =>
   buildPromptLayers(
     {
@@ -68,9 +80,9 @@ const result = computed(() =>
  *   - custom 模式:只有剧情层真的会发送,其余层标注「不发送」并压暗;
  *   - 分层关闭:角色层不发送(与 0.5.0 旧口径一致),拼接退化为固定 + 剧情。
  */
-const layers = computed<Array<PromptLayer & { skipped: boolean; reason?: string }>>(() => {
+const layers = computed<PreviewLayer[]>((): PreviewLayer[] => {
   if (customMode.value) {
-    return LAYER_ORDER.map(id => {
+    return LAYER_ORDER.map((id): PreviewLayer => {
       const found = result.value.layers.find(layer => layer.id === id);
       const base: PromptLayer =
         found ?? { id, label: id, text: '', tagCount: 0, chars: 0, truncated: false };
@@ -92,13 +104,15 @@ const layers = computed<Array<PromptLayer & { skipped: boolean; reason?: string 
     });
   }
   if (!layeredOn.value) {
-    // 分层关:固定正面 + 剧情按旧口径拼,角色层整层不发送
-    const merged = buildPromptLayers(
+    // 分层关:固定正面 + 剧情按旧口径拼,角色层整层不发送。
+    // 这里只给 UI 看的「固定 + 剧情」两条,角色层单独补一条并标 skipped。
+    const sent = buildPromptLayers(
       { fixed: props.fixed, story: props.story, storyNl: props.storyNl },
       { separator: ', ', dedupe: false, budget: 0 },
-    );
+    ).layers.filter(layer => layer.id !== 'character');
+    const [fixedLayer, storyLayer] = sent;
     return [
-      merged.layers[0],
+      { ...fixedLayer, skipped: false },
       {
         id: 'character' as PromptLayerId,
         label: '角色',
@@ -109,10 +123,10 @@ const layers = computed<Array<PromptLayer & { skipped: boolean; reason?: string 
         skipped: true,
         reason: '分层已关闭,角色提示词不会发送',
       },
-      merged.layers[2],
+      { ...storyLayer, skipped: false },
     ];
   }
-  return result.value.layers.map(layer => ({ ...layer, skipped: false }));
+  return result.value.layers.map((layer): PreviewLayer => ({ ...layer, skipped: false }));
 });
 
 /** 实际成品串:custom 模式就是剧情原文,否则走分层拼接。 */

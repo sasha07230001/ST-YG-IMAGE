@@ -5,7 +5,13 @@ import PromptSendPreview from '@/components/PromptSendPreview.vue';
 import Icon from '@/components/Icon.vue';
 import Collapsible from '@/components/Collapsible.vue';
 import BbiTextarea from '@/components/BbiTextarea.vue';
-import { composePositiveLayers, simpleDefaults, type ComfySimpleConfig } from '@/backends/comfyTemplates';import { activeComfyPreset } from '@/state/settings';
+import { composePositiveLayers, simpleDefaults, type ComfySimpleConfig } from '@/backends/comfyTemplates';
+import {
+  LAYER_LABELS,
+  LAYER_ORDER,
+  normalizeLayerOrder,
+  type PromptLayerId,
+} from '@/backends/promptLayers';import { activeComfyPreset } from '@/state/settings';
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 
 /**
@@ -39,6 +45,66 @@ const draftCharacters = ref<ImageCharacterPrompt[]>([]);
 
 /** 拼接规则也先在本地改,同样靠「存回」按钮落地。 */
 const local = ref<ComfySimpleConfig>({ ...current.value });
+
+/**
+ * 层顺序。`local.layerOrder` 是老配置里可能没有的键,用 normalize 补齐后再持有,
+ * 免得模板里 v-for 拿到 undefined。
+ */
+const layerOrder = computed<PromptLayerId[]>({
+  get: () => normalizeLayerOrder(local.value.layerOrder),
+  set: value => {
+    local.value = { ...local.value, layerOrder: normalizeLayerOrder(value) };
+  },
+});
+
+/** 「固定正面(第 N 层)」——N 随拖动变,标题不能写死。 */
+function ordinal(id: PromptLayerId): number {
+  return layerOrder.value.indexOf(id) + 1;
+}
+
+/** 拖动中的层,及悬停目标层。 */
+const dragLayer = ref<PromptLayerId | null>(null);
+const overLayer = ref<PromptLayerId | null>(null);
+
+function onLayerDragStart(id: PromptLayerId, event: DragEvent) {
+  dragLayer.value = id;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', id);
+  }
+}
+
+function onLayerDragOver(id: PromptLayerId, event: DragEvent) {
+  if (!dragLayer.value) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  overLayer.value = id;
+}
+
+/** 松手:把被拖的层插到目标位置(插入位移,不是交换)。 */
+function onLayerDrop(target: PromptLayerId) {
+  const from = dragLayer.value;
+  dragLayer.value = null;
+  overLayer.value = null;
+  if (!from || from === target) return;
+  const next = layerOrder.value.filter(id => id !== from);
+  const at = next.indexOf(target);
+  next.splice(at < 0 ? next.length : at, 0, from);
+  layerOrder.value = next;
+}
+
+function onLayerDragEnd() {
+  dragLayer.value = null;
+  overLayer.value = null;
+}
+
+/** 把固定正面挪回最前。CLIP 对越靠前越敏感,这是唯一值得一键纠正的顺序。 */
+function restoreDefaultOrder() {
+  layerOrder.value = [...LAYER_ORDER];
+}
+
+/** 固定正面不在首位时的提醒(不硬拦,只提示)。 */
+const fixedNotFirst = computed(() => layerOrder.value[0] !== 'fixed');
 
 /** 空中转站/内置链时,tag 正文之外可能还带自然语言段;这里如实展示哪一段会被用。 */
 const effectiveCharacters = computed(() =>
@@ -77,6 +143,10 @@ const stats = computed(() => {
       .map(c => c.tag?.trim())
       .filter(Boolean)
       .join(', '),
+    // 预览不真的出图,尺寸只为满足 SimpleGenValues 的形状;占位符替换用不到
+    seed: 0,
+    width: 0,
+    height: 0,
   });
   return result;
 });
@@ -160,15 +230,15 @@ watch(
 
     <div class="pv-grid">
       <div class="pv-col">
-        <Collapsible title="固定正面(第 1 层)" :open="true">
+        <Collapsible :title="`固定正面(第 ${ordinal('fixed')} 层)`" :open="true">
           <BbiTextarea v-model="draftFixed" :rows="4" placeholder="masterpiece, best quality, 画风词…" />
           <p class="bbi-field-hint">
-            抢在最前:CLIP 对越靠前的 token 越敏感,不少工作流只吃前 75 个 token。
+            抢在最前最安全:CLIP 对越靠前的 token 越敏感,不少工作流只吃前 75 个 token。
             这一格与渠道页的「固定正面」是同一份数据,改完记得存回。
           </p>
         </Collapsible>
 
-        <Collapsible title="角色(第 2 层)" :open="true">
+        <Collapsible :title="`角色(第 ${ordinal('character')} 层)`" :open="true">
           <div
             v-for="(character, index) in draftCharacters"
             :key="index"
@@ -196,7 +266,7 @@ watch(
           </p>
         </Collapsible>
 
-        <Collapsible title="剧情(第 3 层)" :open="true">
+        <Collapsible :title="`剧情(第 ${ordinal('story')} 层)`" :open="true">
           <BbiTextarea v-model="draftStory" :rows="4" placeholder="模型编译出的画面 tag…" />
           <p class="bbi-field-hint">
             出图时这一格来自「提示词」页那条链(内置 LLM 分析或中转站编译)对本楼正文的编译结果。
@@ -239,6 +309,43 @@ watch(
             <input v-model.number="local.tagBudget" class="bbi-input bbi-num" type="number" min="0" max="400" step="5" />
           </div>
           <p class="bbi-field-hint">0 = 不限。超了从末层末尾往前砍,固定正面永远保得住。</p>
+
+          <div class="bbi-field">
+            <div class="bbi-field-head">
+              <span class="bbi-field-label">层顺序</span>
+              <button class="bbi-btn bbi-btn-sm" type="button" @click="restoreDefaultOrder">
+                恢复默认
+              </button>
+            </div>
+            <ol class="pv-order">
+              <li
+                v-for="id in layerOrder"
+                :key="id"
+                class="pv-order-item"
+                :class="{
+                  'is-dragging': dragLayer === id,
+                  'is-over': overLayer === id && dragLayer !== id,
+                  'is-first': id === 'fixed',
+                }"
+                draggable="true"
+                @dragstart="onLayerDragStart(id, $event)"
+                @dragover="onLayerDragOver(id, $event)"
+                @dragleave="overLayer = null"
+                @drop.prevent="onLayerDrop(id)"
+                @dragend="onLayerDragEnd"
+              >
+                <span class="pv-order-grip" aria-hidden="true">⋮⋮</span>
+                <span class="pv-order-num">{{ layerOrder.indexOf(id) + 1 }}</span>
+                <span class="pv-order-name">{{ LAYER_LABELS[id] }}</span>
+              </li>
+            </ol>
+          </div>
+          <p v-if="fixedNotFirst" class="bbi-field-hint pv-order-warn">
+            固定正面已不在最前。CLIP 对越靠前的 token 越敏感,画风词排到后面可能吃不到权重。
+          </p>
+          <p v-else class="bbi-field-hint">
+            拖动可改顺序;跨层去重按「先出现的层保留」判定,顺序会反过来影响谁被吸收。
+          </p>
 
           <div class="pv-ops">
             <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="saveToPreset">存回渠道页</button>
@@ -358,6 +465,58 @@ watch(
   display: flex;
   gap: 8px;
   margin-bottom: 6px;
+}
+
+/* 层顺序列表:每行是一层,拖动改插入位次 */
+.pv-order {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pv-order-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface-2);
+  cursor: grab;
+  user-select: none;
+  font-size: 12px;
+}
+.pv-order-item:active {
+  cursor: grabbing;
+}
+.pv-order-item.is-first {
+  border-color: var(--bbi-accent);
+}
+.pv-order-item.is-dragging {
+  opacity: 0.45;
+}
+/* 插入位置提示:一条实心 accent 上边线,比整行高亮更能表达「插到这里」 */
+.pv-order-item.is-over {
+  box-shadow: inset 0 2px 0 var(--bbi-accent);
+}
+.pv-order-grip {
+  color: var(--bbi-text-dim);
+  letter-spacing: -2px;
+}
+.pv-order-num {
+  width: 1.2em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--bbi-text-dim);
+}
+.pv-order-name {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pv-order-warn {
+  color: var(--bbi-warn);
 }
 
 .pv-ops {
