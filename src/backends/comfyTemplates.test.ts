@@ -3,9 +3,12 @@ import { describe, expect, it } from 'vitest';
 import {
   COMFY_TEMPLATES,
   layerOptionsOf,
+  negativeOptionsOf,
   normalizeSimpleConfig,
   simpleDefaults,
   buildSimpleWorkflow,
+  composeNegative,
+  composeNegativeLayersOf,
   composePositive,
   composePositiveLayers,
 } from '@/backends/comfyTemplates';
@@ -200,5 +203,67 @@ describe('buildSimpleWorkflow 把分层结果写进正向 CLIPTextEncode', () =>
 
   it('三个模板都在模板表里', () => {
     expect(Object.keys(COMFY_TEMPLATES).sort()).toEqual(['anima', 'checkpoint', 'flux']);
+  });
+});
+
+/**
+ * 负面的链路级回归。
+ *
+ * 正向测的是「层序对不对」;负面要测的是「真实的那个字符串有没有按分层口径生成」,
+ * 因为负面不进预览页也会进工作流 —— 预览骗人的代价是每张图的手指数量。
+ */
+describe('composeNegative 的分层口径', () => {
+  it('固定负面在前、本图排除在后', () => {
+    const simple = config({ negative: 'worst quality, bad anatomy' });
+    expect(composeNegative(simple, V({ negative: 'extra people' }))).toBe(
+      'worst quality, bad anatomy, extra people',
+    );
+  });
+
+  it('两段都空时返回空串,不给 ComfyUI 送去一个逗号', () => {
+    expect(composeNegative(config({ negative: '' }), V())).toBe('');
+  });
+
+  it('动态词重复固定负面时只发一次', () => {
+    const simple = config({ negative: 'lowres, worst quality' });
+    const result = composeNegativeLayersOf(simple, V({ negative: 'lowres' }));
+    expect(result.text).toBe('lowres, worst quality');
+    expect(result.droppedDuplicates).toBe(1);
+  });
+
+  it('分隔符与正向共用', () => {
+    const simple = config({ negative: 'lowres', layerSeparator: '\n' });
+    expect(composeNegative(simple, V({ negative: 'blurry' }))).toBe('lowres\nblurry');
+  });
+
+  it('去重开关与正向共用', () => {
+    const simple = config({ negative: 'lowres', dedupeTags: false });
+    expect(composeNegative(simple, V({ negative: 'lowres' }))).toBe('lowres, lowres');
+  });
+
+  it('正向预算不会顺手砍负面', () => {
+    // 用户为了 CLIP 的 75 token 把正向预算调成 60,负面的 anatomy 词不能被一起砍
+    const simple = config({ negative: 'a, b, c, d, e', tagBudget: 2 });
+    expect(composeNegative(simple, V({ negative: 'f, g' }))).toBe('a, b, c, d, e, f, g');
+    expect(negativeOptionsOf(simple).budget).toBe(0);
+  });
+
+  it('composeNegativeLayersOf 与 composeNegative 同口径', () => {
+    const simple = config({ negative: 'worst quality' });
+    const values = V({ negative: 'extra people, extra people' });
+    expect(composeNegativeLayersOf(simple, values).text).toBe(composeNegative(simple, values));
+  });
+
+  it('buildSimpleWorkflow 把负面写进负向 CLIPTextEncode', () => {
+    const simple = config({ negative: 'worst quality, bad anatomy', steps: 20, cfg: 7 });
+    const workflow = buildSimpleWorkflow(simple, V({ negative: 'extra people' })) as Record<
+      string,
+      { class_type: string; inputs: Record<string, unknown> }
+    >;
+    const negativeNode = Object.values(workflow).find(
+      node => node.class_type === 'CLIPTextEncode' && String(node.inputs.text).includes('bad anatomy'),
+    );
+    expect(negativeNode).toBeDefined();
+    expect(negativeNode?.inputs.text).toBe('worst quality, bad anatomy, extra people');
   });
 });

@@ -17,11 +17,15 @@
 
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import {
+  buildNegativeLayers,
   buildPromptLayers,
   composeLayeredPrompt,
+  composeNegativeLayers,
   DEFAULT_SEPARATOR,
   LAYER_ORDER,
   normalizeLayerOrder,
+  type NegativeLayerOptions,
+  type NegativeLayersResult,
   type PromptLayerId,
   type PromptLayerOptions,
   type PromptLayersResult,
@@ -360,9 +364,54 @@ export function composePositiveLayers(
   );
 }
 
-/** 负面 = 固定负面 + AI 动态负面追加。 */
+/**
+ * 负面提示词。
+ *
+ * 与正向对称,也走分层:`固定负面`(渠道页填的通用词)+ `本图排除`(AI 按画面编译的动态词),
+ * 由 `promptLayers.buildNegativeLayers` 统一拼。两段的差别必须留住 ——
+ * 固定负面是用户定的基线,动态词是每张都换的,预算只砍后者。
+ *
+ * 为什么不再用 `joinParts(simple.negative, values.negative)` 硬拼:
+ * 硬拼会把 AI 重复写一遍的 `lowres` 也算一个 tag,预览里看不出谁在吃预算;
+ * 更糟的是分不清「这一串里哪一段是我写的、哪一段是模型塞的」,调词时无从下手。
+ */
 export function composeNegative(simple: ComfySimpleConfig, values: SimpleGenValues): string {
-  return joinParts(simple.negative, values.negative);
+  return composeNegativeLayers(
+    { builtin: simple.negative, dynamic: values.negative },
+    negativeOptionsOf(simple),
+  );
+}
+
+/** 负面分层明细(UI 预览与随图记录用;与 composeNegative 同一份实现)。 */
+export function composeNegativeLayersOf(
+  simple: ComfySimpleConfig,
+  values: SimpleGenValues,
+): NegativeLayersResult {
+  return buildNegativeLayers(
+    { builtin: simple.negative, dynamic: values.negative },
+    negativeOptionsOf(simple),
+  );
+}
+
+/**
+ * 负面拼接选项。
+ *
+ * `separator` 与正向共用同一个旋钮:分隔符是「这一套提示词怎么写」的属性,
+ * 不是「正向怎么写」的属性 —— 用户既然把层间连接符改成换行,负面也该跟着换,
+ * 否则两个框里一半逗号一半换行,像是 bug。
+ *
+ * `dedupe` 也共用:跨层去重关掉时,负面同样不该偷偷去重。
+ *
+ * `budget` **不共用**:正向的 tag 预算是给 CLIP 的 75 token 上限算的,
+ * 负面超长通常无害(大多数采样器对负面不做截断,或者截断也不影响主画面)。
+ * 强绑定会让用户为了正向调个 60,把 anatomy 负面词顺手砍掉 —— 换来六根手指。
+ */
+export function negativeOptionsOf(simple: ComfySimpleConfig): NegativeLayerOptions {
+  return {
+    separator: simple.layerSeparator || DEFAULT_SEPARATOR,
+    dedupe: simple.dedupeTags !== false,
+    budget: 0,
+  };
 }
 
 /**

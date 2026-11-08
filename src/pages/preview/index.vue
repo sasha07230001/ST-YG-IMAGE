@@ -5,13 +5,15 @@ import PromptSendPreview from '@/components/PromptSendPreview.vue';
 import Icon from '@/components/Icon.vue';
 import Collapsible from '@/components/Collapsible.vue';
 import BbiTextarea from '@/components/BbiTextarea.vue';
-import { composePositiveLayers, simpleDefaults, type ComfySimpleConfig } from '@/backends/comfyTemplates';
+import { composePositiveLayers, simpleDefaults, templateSupportsNegative, type ComfySimpleConfig } from '@/backends/comfyTemplates';
 import {
   LAYER_LABELS,
   LAYER_ORDER,
+  buildNegativeLayers,
   normalizeLayerOrder,
   type PromptLayerId,
-} from '@/backends/promptLayers';import { activeComfyPreset } from '@/state/settings';
+} from '@/backends/promptLayers';
+import { activeComfyPreset } from '@/state/settings';
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 
 /**
@@ -39,9 +41,14 @@ const isSimple = computed(() => preset.mode === 'simple');
 /** 这一页的全部输入都是草稿:改到满意再存,避免调词时把线上配置搅乱。 */
 const draftFixed = ref(current.value.positive ?? '');
 const draftNegative = ref(current.value.negative ?? '');
+/** 本图排除词(动态负面)的草稿。出图时由 AI 按正文编译,这里填示例方便试。 */
+const draftNegativeDynamic = ref('extra people, duplicate character');
 const draftStory = ref('1girl, silver hair, red eyes, standing in the rain');
 const draftStoryNl = ref('');
 const draftCharacters = ref<ImageCharacterPrompt[]>([]);
+
+/** 当前架构吃不吃负面。Flux 系恒不吃,预览要如实说明这一格填了也白填。 */
+const negativeSupported = computed(() => templateSupportsNegative(current.value.template));
 
 /** 拼接规则也先在本地改,同样靠「存回」按钮落地。 */
 const local = ref<ComfySimpleConfig>({ ...current.value });
@@ -151,12 +158,24 @@ const stats = computed(() => {
   return result;
 });
 
+/** 负面的统计:与正向分开展示,因为两边的坑不同(正面怕超长,负面怕被挤掉)。 */
+const negStats = computed(() =>
+  buildNegativeLayers(
+    { builtin: draftNegative.value, dynamic: draftNegativeDynamic.value },
+    {
+      separator: local.value.layerSeparator || ', ',
+      dedupe: local.value.dedupeTags !== false,
+      budget: 0,
+    },
+  ),
+);
+
 /** 与渠道页已保存的值比对,提醒「这页看到的和线上不一样」。 */
 const drift = computed(() => {
   const saved = current.value;
   const diff: string[] = [];
   if ((saved.positive ?? '') !== draftFixed.value) diff.push('固定正面');
-  if ((saved.negative ?? '') !== draftNegative.value) diff.push('负面');
+  if ((saved.negative ?? '') !== draftNegative.value) diff.push('固定负面');
   if ((saved.layered !== false) !== (local.value.layered !== false)) diff.push('分层开关');
   if ((saved.layerSeparator || ', ') !== (local.value.layerSeparator || ', ')) diff.push('层间连接符');
   if ((saved.dedupeTags !== false) !== (local.value.dedupeTags !== false)) diff.push('去重');
@@ -277,6 +296,45 @@ watch(
           </div>
         </Collapsible>
 
+        <!--
+          负面:与正面并列成两段(不是第四层)。
+          固定负面是用户自己定的基线,本图排除是 AI 每张都换的;谁被谁挤掉必须看得见。
+        -->
+        <Collapsible :title="negativeSupported === false ? '负面(本架构不支持)' : '负面'" :open="true">
+          <div class="bbi-field">
+            <div class="bbi-field-head"><span class="bbi-field-label">固定负面</span></div>
+            <BbiTextarea
+              v-model="draftNegative"
+              :rows="3"
+              placeholder="worst quality, low quality, lowres, bad anatomy, bad hands, watermark…"
+            />
+            <p class="bbi-field-hint">
+              就是渠道页「固定负面」那一格。永远发在最前,不会被本图排除词挤掉。
+            </p>
+          </div>
+
+          <div class="bbi-field">
+            <div class="bbi-field-head"><span class="bbi-field-label">本图排除(动态)</span></div>
+            <BbiTextarea
+              v-model="draftNegativeDynamic"
+              :rows="2"
+              placeholder="extra people, duplicate character…"
+            />
+            <p class="bbi-field-hint">
+              出图时由 AI 按本楼正文编译,只排除与正文冲突或本构图容易误生成的内容,可为空。
+              这里填的是试衣稿,只影响预览。
+            </p>
+          </div>
+
+          <p v-if="negativeSupported === false" class="bbi-field-hint pv-order-warn">
+            当前架构(Flux 系)没有真实负面输入:这两格填了也不会进工作流。
+          </p>
+          <p v-else class="bbi-field-hint">
+            两段合并顺序固定为「固定负面 → 本图排除」,与正向的层顺序无关 ——
+            负面两段谁先谁后对采样没有差别,能拖反而让人以为有区别。
+          </p>
+        </Collapsible>
+
         <Collapsible title="拼接规则" :open="true">
           <label class="bbi-switch-row">
             <span class="bbi-field-label">开启三层拼接</span>
@@ -367,7 +425,9 @@ watch(
           :story="draftStory"
           :story-nl="draftStoryNl"
           :characters="effectiveCharacters"
-          :negative="draftNegative"
+          :negative-builtin="draftNegative"
+          :negative-dynamic="draftNegativeDynamic"
+          :negative-supported="negativeSupported"
           title="这一次会发出去的"
         />
 

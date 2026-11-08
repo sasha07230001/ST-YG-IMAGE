@@ -3,7 +3,11 @@ import Icon from '@/components/Icon.vue';
 import {
   LAYER_ORDER,
   LAYER_HINTS,
+  NEGATIVE_LAYER_HINTS,
+  buildNegativeLayers,
   buildPromptLayers,
+  type NegativeLayer,
+  type NegativeLayerId,
   type PromptLayer,
   type PromptLayerId,
 } from '@/backends/promptLayers';
@@ -12,19 +16,23 @@ import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import { computed, ref } from 'vue';
 
 /**
- * 发送预览:把「这次真正会送进 ComfyUI 正面提示词框的那一串」原样摊开给用户看。
+ * 发送预览:把「这次真正会送进 ComfyUI 提示词框的那一串」原样摊开给用户看。
  *
- * 为什么需要它:三层拼接发生在后端组装里,`composePositive` 一返回就是一个长串,
+ * 为什么需要它:分层拼接发生在后端组装里,`composePositive` 一返回就是一个长串,
  * 用户在原界面只能改「固定正面」那一格,看不到角色层与剧情层最后落在哪、
  * 中间还有没有被去重/被预算砍掉的东西。改采样器参数时凭感觉调词,效率极低。
  *
- * 为什么这里复用 `buildPromptLayers` 而不是自己再拼一遍:预览与真实发送必须同一个口径。
- * 各写一份的话,面板上显示 40 个 tag、实际发出去 37 个,用户永远查不出为什么。
+ * 为什么这里复用 `buildPromptLayers` / `buildNegativeLayers` 而不是自己再拼一遍:
+ * 预览与真实发送必须同一个口径。各写一份的话,面板上显示 40 个 tag、实际发出去 37 个,
+ * 用户永远查不出为什么。
  *
- * 三处调用点(渠道页 / 提示词页 / 手动编辑弹窗)传的字段各有缺省:
- *   - 渠道页:只有固定正面 + 负面,剧情层用占位文案说明「出图时才有」;
- *   - 提示词页:可自由试衣,五格全手填;
+ * 正面三处调用点(渠道页 / 发送预览页 / 手动编辑弹窗)传的字段各有缺省:
+ *   - 渠道页:只有固定正面,剧情层用占位文案说明「出图时才有」;
+ *   - 发送预览页:可自由试衣,五格全手填;
  *   - 编辑弹窗:拿当楼草稿,是最接近真实的一次。
+ *
+ * 负面只有两段(固定负面 + 本图排除),但它和正向一样需要摊开:
+ * 用户踩过的坑是「AI 的动态负面把固定负面挤掉了」,合并成一串之后就再也查不出来。
  */
 const props = defineProps<{
   /** 拼接规则来源(分隔符 / 去重 / 预算)。给 null 用默认口径。 */
@@ -37,7 +45,14 @@ const props = defineProps<{
   characters?: ImageCharacterPrompt[];
   /** 已合成的角色档案串(常驻 + 临时),与 characters 一起构成角色层。 */
   characterTag?: string;
+  /** 最终负面串(固定 + 动态)。传了 `negativeDynamic` 时以分层口径重算,覆盖这里。 */
   negative?: string;
+  /** 固定负面(渠道页那一格)。给了它就走分层,能看出两段谁被挤掉。 */
+  negativeBuiltin?: string;
+  /** AI 动态负面(本图专用)。 */
+  negativeDynamic?: string;
+  /** 模板是否支持负面(Flux 系恒不支持,预览要说明「这一格不会发」)。 */
+  negativeSupported?: boolean;
   title?: string;
   /** 嵌在窄栏里时收紧留白。 */
   compact?: boolean;
@@ -141,6 +156,93 @@ const finalText = computed(() => {
   return result.value.text;
 });
 
+/* ---------- 负面 ---------- */
+
+/**
+ * 负面取分层口径的前提:拿到了固定负面这一格。
+ * 只给 `negative`(已拼好的成品串)时不分层 —— 拼接信息已经丢了,硬拆只能靠猜。
+ */
+const negativeLayered = computed(
+  () => props.negativeBuiltin !== undefined || props.negativeDynamic !== undefined,
+);
+
+const negativeResult = computed(() =>
+  buildNegativeLayers(
+    {
+      builtin: props.negativeBuiltin ?? '',
+      dynamic: props.negativeDynamic ?? '',
+    },
+    {
+      separator: props.config?.layerSeparator,
+      dedupe: props.config?.dedupeTags !== false,
+      // 负面预算恒为 0:砍负面比砍正向危险得多,见 comfyTemplates.negativeOptionsOf
+      budget: 0,
+    },
+  ),
+);
+
+/**
+ * 负面展示行。两种降级:
+ *   - custom 模式:负面由工作流里的 %negative_prompt% 自己取,这两段都没有位置,只显示固定负面;
+ *   - 模板不支持负面(Flux):两段都标 skipped。
+ */
+interface PreviewNegLayer extends NegativeLayer {
+  skipped: boolean;
+  reason?: string;
+}
+
+const negativeLayers = computed<PreviewNegLayer[]>((): PreviewNegLayer[] => {
+  if (props.negativeSupported === false) {
+    return negativeResult.value.layers.map((layer): PreviewNegLayer => ({
+      ...layer,
+      skipped: true,
+      reason: '当前架构不支持负面输入',
+    }));
+  }
+  if (customMode.value) {
+    return negativeResult.value.layers.map((layer): PreviewNegLayer =>
+      layer.id === 'builtin'
+        ? { ...layer, skipped: false }
+        : { ...layer, skipped: true, reason: 'custom 模式的动态负面走 %negative_prompt%' },
+    );
+  }
+  return negativeResult.value.layers.map((layer): PreviewNegLayer => ({ ...layer, skipped: false }));
+});
+
+/**
+ * 负面成品串。
+ *   - 分层口径:走 buildNegativeLayers;
+ *   - 只给了成品串:原样显示(它就是 composeNegative 的输出);
+ *   - 什么也没给:空。
+ */
+const negativeText = computed(() => {
+  if (negativeLayered.value) {
+    if (props.negativeSupported === false) return '';
+    return negativeResult.value.text;
+  }
+  return String(props.negative ?? '').trim();
+});
+
+const negativeChars = computed(() => negativeText.value.length);
+const negativeTags = computed(() =>
+  negativeLayered.value ? String(negativeResult.value.tagCount) : '—',
+);
+
+const negativeCopied = ref(false);
+let negCopyTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function copyNegative() {
+  if (!negativeText.value) return;
+  try {
+    await navigator.clipboard.writeText(negativeText.value);
+    negativeCopied.value = true;
+    if (negCopyTimer) clearTimeout(negCopyTimer);
+    negCopyTimer = setTimeout(() => (negativeCopied.value = false), 1200);
+  } catch {
+    negativeCopied.value = false;
+  }
+}
+
 const finalChars = computed(() => finalText.value.length);
 const finalTags = computed(() => (customMode.value ? '—' : String(result.value.tagCount)));
 
@@ -162,6 +264,10 @@ async function copyFinal() {
 
 function hintOf(id: PromptLayerId): string {
   return LAYER_HINTS[id] ?? '';
+}
+
+function negHintOf(id: NegativeLayerId): string {
+  return NEGATIVE_LAYER_HINTS[id] ?? '';
 }
 </script>
 
@@ -224,11 +330,55 @@ function hintOf(id: PromptLayerId): string {
       <pre class="bsp-final-text">{{ finalText || '(空)' }}</pre>
     </div>
 
-    <div v-if="negative" class="bsp-final is-negative">
+    <!--
+      负面。和正向一样摊成两段:固定负面是用户定的基线,本图排除是 AI 每张都换的词。
+      合在一起显示就看不出「动态词有没有把固定负面挤掉」,而那正是这一块存在的理由。
+    -->
+    <div class="bsp-final is-negative">
       <div class="bsp-final-head">
-        <span>负面提示词</span>
+        <span>
+          负面提示词
+          <em class="bsp-neg-meta">{{ negativeTags }} tag · {{ negativeChars }} 字</em>
+        </span>
+        <button type="button" class="bsp-copy" :disabled="!negativeText" @click="copyNegative">
+          <Icon name="copy" :size="12" />
+          {{ negativeCopied ? '已复制' : '复制' }}
+        </button>
       </div>
-      <pre class="bsp-final-text">{{ negative }}</pre>
+
+      <ol v-if="negativeLayered" class="bsp-layers bsp-layers-neg">
+        <li
+          v-for="(layer, index) in negativeLayers"
+          :key="layer.id"
+          class="bsp-layer"
+          :class="{ 'is-skipped': layer.skipped }"
+        >
+          <div class="bsp-layer-head">
+            <span class="bsp-order bsp-order-neg">{{ layer.skipped ? '—' : index + 1 }}</span>
+            <span class="bsp-layer-name" :title="negHintOf(layer.id)">{{ layer.label }}</span>
+            <span v-if="layer.skipped" class="bsp-tag-count bsp-muted">{{ layer.reason }}</span>
+            <span v-else class="bsp-tag-count">{{ layer.tagCount }} tag</span>
+          </div>
+          <p v-if="!layer.skipped && layer.text" class="bsp-layer-text">{{ layer.text }}</p>
+          <p v-else-if="!layer.skipped" class="bsp-empty">这一层没有内容</p>
+          <p v-if="layer.note" class="bsp-layer-note">{{ layer.note }}</p>
+        </li>
+      </ol>
+
+      <p
+        v-if="
+          negativeLayered &&
+          negativeResult.droppedDuplicates > 0
+        "
+        class="bsp-notice"
+      >
+        动态词里有 {{ negativeResult.droppedDuplicates }} 个与固定负面的重复,已吸收(重复不改变采样结果,只白吃额度)
+      </p>
+      <p v-if="negativeSupported === false" class="bsp-notice bsp-notice-warn">
+        当前架构(Flux 系)没有真实负面输入,这一格填了也不会进工作流。
+      </p>
+
+      <pre class="bsp-final-text">{{ negativeText || '(空——只有固定负面时才留空是正常的)' }}</pre>
     </div>
   </div>
 </template>
@@ -357,6 +507,19 @@ function hintOf(id: PromptLayerId): string {
 }
 .bsp-final.is-negative {
   padding-top: 4px;
+}
+.bsp-neg-meta {
+  margin-left: 6px;
+  font-style: normal;
+  font-weight: 400;
+  font-size: 10.5px;
+  color: var(--bbi-ink-soft);
+}
+.bsp-layers-neg .bsp-order-neg {
+  background: var(--bbi-ink-soft);
+}
+.bsp-notice-warn {
+  color: var(--bbi-warn, #b8860b);
 }
 .bsp-final-head {
   display: flex;

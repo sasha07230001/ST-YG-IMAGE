@@ -3,8 +3,11 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SEPARATOR,
   LAYER_ORDER,
+  NEGATIVE_LAYER_ORDER,
+  buildNegativeLayers,
   buildPromptLayers,
   composeLayeredPrompt,
+  composeNegativeLayers,
   legacyJoin,
   normalizeLayerOrder,
   pinFixedFirst,
@@ -310,5 +313,138 @@ describe('buildPromptLayers 的层顺序', () => {
     // 剧情拖到最前:末层变角色 → 砍角色
     const flippedCut = buildPromptLayers(long, { budget: 4, order: ['story', 'fixed', 'character'] });
     expect(flippedCut.text).toBe('s1, s2, f1, f2');
+  });
+});
+
+/**
+ * 负面分层。
+ *
+ * 正向那套测的是「谁排前面、谁被砍」;负面要测的完全不同,因为它的风险不对称:
+ * 砍多了换来六根手指,顺序改错了对采样毫无影响。所以这里逐条钉住:
+ * 1. 固定负面永远在前、永远不被预算碰;
+ * 2. 顺序**不可拖**(NEGATIVE_LAYER_ORDER 恒定),否则 UI 会暗示一个不存在的自由度;
+ * 3. 动态段与固定段重复时,重复的被吸收而不是白吃额度。
+ */
+describe('buildNegativeLayers', () => {
+  it('固定负面在前,本图排除在后', () => {
+    const result = buildNegativeLayers({
+      builtin: 'worst quality, bad anatomy',
+      dynamic: 'extra people',
+    });
+    expect(result.text).toBe('worst quality, bad anatomy, extra people');
+    expect(result.layers.map(layer => layer.id)).toEqual(['builtin', 'dynamic']);
+    expect(result.tagCount).toBe(3);
+  });
+
+  it('顺序恒为 固定负面 → 本图排除,不提供拖动', () => {
+    expect([...NEGATIVE_LAYER_ORDER]).toEqual(['builtin', 'dynamic']);
+    const result = buildNegativeLayers({ builtin: 'a', dynamic: 'b' });
+    expect(result.order).toEqual(['builtin', 'dynamic']);
+  });
+
+  it('两段都空时成品是空串,不留分隔符', () => {
+    expect(buildNegativeLayers({}).text).toBe('');
+    expect(buildNegativeLayers({ builtin: '  ', dynamic: '' }).text).toBe('');
+  });
+
+  it('只有动态词时也能拼(固定负面留空是常见的)', () => {
+    const result = buildNegativeLayers({ dynamic: 'extra people, duplicate character' });
+    expect(result.text).toBe('extra people, duplicate character');
+    expect(result.layers[0].text).toBe('');
+    expect(result.layers[1].tagCount).toBe(2);
+  });
+
+  it('动态词重复固定负面时被吸收,并记进 droppedDuplicates', () => {
+    const result = buildNegativeLayers({
+      builtin: 'lowres, worst quality',
+      dynamic: 'lowres, extra people',
+    });
+    expect(result.text).toBe('lowres, worst quality, extra people');
+    expect(result.droppedDuplicates).toBe(1);
+  });
+
+  it('权重写法与下划线写法同样归一(与正向同一把 tagKey)', () => {
+    const result = buildNegativeLayers({
+      builtin: 'bad hands:1.2',
+      dynamic: 'bad_hands',
+    });
+    expect(result.droppedDuplicates).toBe(1);
+    expect(result.layers[1].tagCount).toBe(0);
+  });
+
+  it('带括号的权重词不会被误当重复:(a:1.2) 与 a 是两个词', () => {
+    // 括号让权重后缀不再是串尾,所以 tagKey 不砍它 —— 这是既有行为,负面同样继承。
+    // 写进测试是为了钉住「预览显示的去重数与真实发送一致」,不是判断哪种更好。
+    const result = buildNegativeLayers({
+      builtin: '(bad hands:1.2)',
+      dynamic: 'bad hands',
+    });
+    expect(result.droppedDuplicates).toBe(0);
+    expect(result.tagCount).toBe(2);
+  });
+
+  it('去重关掉时重复词照发', () => {
+    const result = buildNegativeLayers(
+      { builtin: 'lowres', dynamic: 'lowres' },
+      { dedupe: false },
+    );
+    expect(result.text).toBe('lowres, lowres');
+    expect(result.droppedDuplicates).toBe(0);
+  });
+
+  it('预算只砍动态段末尾,固定负面一个不碰', () => {
+    const result = buildNegativeLayers(
+      { builtin: 'w1, w2, w3', dynamic: 'd1, d2, d3' },
+      { budget: 4 },
+    );
+    expect(result.text).toBe('w1, w2, w3, d1');
+    expect(result.droppedByBudget).toBe(2);
+    expect(result.layers[0].truncated).toBe(false);
+    expect(result.layers[1].truncated).toBe(true);
+  });
+
+  it('动态段砍空仍超预算时停手,不碰固定负面', () => {
+    const result = buildNegativeLayers(
+      { builtin: 'w1, w2, w3', dynamic: 'd1' },
+      { budget: 1 },
+    );
+    // 预算 1 比固定负面本身还小,也只能砍掉动态那一个,固定负面仍是三条
+    expect(result.text).toBe('w1, w2, w3');
+    expect(result.droppedByBudget).toBe(1);
+  });
+
+  it('预算为 0 时不限', () => {
+    const many = Array.from({ length: 50 }, (_, i) => `t${i}`).join(', ');
+    const result = buildNegativeLayers({ builtin: many }, { budget: 0 });
+    expect(result.tagCount).toBe(50);
+    expect(result.droppedByBudget).toBe(0);
+  });
+
+  it('分隔符可换(顿号 / 换行)', () => {
+    expect(
+      buildNegativeLayers({ builtin: 'a, b', dynamic: 'c' }, { separator: '、' }).text,
+    ).toBe('a、b、c');
+    expect(
+      buildNegativeLayers({ builtin: 'a, b', dynamic: 'c' }, { separator: '\n' }).text,
+    ).toBe('a\nb\nc');
+  });
+
+  it('动态段整段被吸收时给出说明', () => {
+    const result = buildNegativeLayers({ builtin: 'lowres', dynamic: 'lowres' });
+    expect(result.layers[1].note).toContain('吸收');
+  });
+});
+
+describe('composeNegativeLayers 与 buildNegativeLayers 同口径', () => {
+  it('成品串一致', () => {
+    const source = { builtin: 'lowres, bad anatomy', dynamic: 'extra people' };
+    const options = { separator: ', ', dedupe: true, budget: 0 };
+    expect(composeNegativeLayers(source, options)).toBe(
+      buildNegativeLayers(source, options).text,
+    );
+  });
+
+  it('空输入返回空串而不是分隔符', () => {
+    expect(composeNegativeLayers({})).toBe('');
   });
 });

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import type { Orientation } from '@/backends/size';
+import { templateSupportsNegative } from '@/backends/comfyTemplates';
 import BbiTextarea from '@/components/BbiTextarea.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
@@ -161,12 +162,13 @@ const comfyMode = computed<'custom' | 'simple'>(() =>
 );
 const comfySimple = computed(() => comfyPreset.value.simple);
 const comfyFixed = computed(() => comfyPreset.value.simple.positive ?? '');
-/** 固定负面 + 本画面负面:两者在发送时是叠加的,预览里合起来才是真值。 */
-const comboNegative = computed(() =>
-  [comfyPreset.value.simple.negative ?? '', draft.value.negative]
-    .map(part => part.trim())
-    .filter(Boolean)
-    .join(', '),
+/** 固定负面(渠道页那一格)。预览要分层摊开,所以两段分开传而不是先拼好。 */
+const comfyNegBuiltin = computed(() => comfyPreset.value.simple.negative ?? '');
+/** 本画面动态负面(这一楼 AI 编译出来的)。 */
+const comfyNegDynamic = computed(() => draft.value.negative ?? '');
+/** 当前架构到底吃不吃负面(Flux 系恒不吃,预览要如实说明)。 */
+const comfyNegSupported = computed(() =>
+  templateSupportsNegative(comfyPreset.value.simple.template),
 );
 
 /**
@@ -413,7 +415,9 @@ onBeforeUnmount(() => {
         :story="draft.tag"
         :story-nl="draft.nl"
         :characters="draft.characters"
-        :negative="comboNegative"
+        :negative-builtin="comfyNegBuiltin"
+        :negative-dynamic="comfyNegDynamic"
+        :negative-supported="comfyNegSupported"
         title="这一次会发出去的"
         compact
       />

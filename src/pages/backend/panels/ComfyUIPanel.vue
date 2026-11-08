@@ -886,7 +886,9 @@ function applyAssist() {
               mode="simple"
               :fixed="active.simple.positive"
               story="1girl, standing in the rain(出图时由 AI 按本楼正文编译)"
-              :negative="active.simple.negative"
+              :negative-builtin="active.simple.negative"
+              :negative-dynamic="'rain, umbrella(示例:AI 本图排除词,每张不同)'"
+              :negative-supported="meta.supportsNegative"
               compact
             />
             <p class="wf-layer-hint">

@@ -26,6 +26,12 @@
  * 所以画风词必须在最前;而剧情 tag 里已经写了这一楼发生了什么,角色档案跟在它后面
  * 才有「补充这个人具体长这样」的效果,同时仍压得住临时状态。
  *
+ * ## 反面也有层
+ *
+ * 阴性段不是简单地「固定 + 追加」:`buildNegativeLayers` 把负面拆成
+ * 「固定负面(用户定的基线)」与「本图排除(AI 按画面写的)」两段,默认高优先保前者。
+ * 详见下文负面段那一大块注释。
+ *
  * ## 本模块是纯函数
  *
  * 不 import settings、不碰宿主。理由:它要同时被后端组装(comfyui/comfyTemplates)、
@@ -364,6 +370,186 @@ export function composeLayeredPrompt(
   options: PromptLayerOptions = {},
 ): string {
   return buildPromptLayers(source, options).text;
+}
+
+/* ==================================================================
+ * 负面提示词
+ * ==================================================================
+ *
+ * 负面层为什么不能直接复用 PromptLayerSource:正负两边的「层」不只是 id 不同,
+ * 连语义都不对称。
+ *
+ * | | 正向 | 负面 |
+ * |---|---|---|
+ * | 固定层 | 质量词、画风词 —— 越多越好 | 通用负面词(低质/畸形) —— 定海神针,必须存活 |
+ * | 动态层 | 剧情/角色 —— 每张都换 | 本画面专用排除词 —— 可能有,可能空 |
+ * | 顺序 | 可拖动,决定谁占 CLIP 前 75 token | **不可拖**:负面两段谁先谁后对采样无差别 |
+ *
+ * 所以这里刻意不引入第四个 PromptLayerId,而是给负面一套独立的双段模型:
+ * `builtin`(渠道页固定负面)+ `dynamic`(AI 按本画面编译)。两段的差别必须
+ * 在预览里看得见 —— 用户真正会踩的坑是「固定负面被 AI 的动态词挤掉了」,
+ * 而这个在合并成一串之后就再也查不出来。
+ *
+ * 为什么负面也有预算:CLIP 对负面的解析同样是 75 token 一段,某些采样器
+ * (尤其 CFG 高的 SDXL 工作流)在负面超长时会把末尾权重摊薄。但默认 0(不限),
+ * 因为砍负面比砍正向更危险:砍掉 anatomy 词直接换来六根手指。
+ */
+
+/** 负面提示词的层 id。与正向的 PromptLayerId 是两个命名空间,故意不重合。 */
+export type NegativeLayerId = 'builtin' | 'dynamic';
+
+/** 默认顺序。负面**不可拖动**,这个常量只用于遍历与显示编号。 */
+export const NEGATIVE_LAYER_ORDER: readonly NegativeLayerId[] = ['builtin', 'dynamic'] as const;
+
+/** 每层显示名。 */
+export const NEGATIVE_LAYER_LABELS: Record<NegativeLayerId, string> = {
+  builtin: '固定负面',
+  dynamic: '本图排除',
+};
+
+/** 每层「管什么」的一句话说明。 */
+export const NEGATIVE_LAYER_HINTS: Record<NegativeLayerId, string> = {
+  builtin: '渠道页填的通用负面词(低质、畸形、水印等)。永远发在最前,不被动态词挤掉。',
+  dynamic: 'AI 按本画面正文编译出的排除词,只排除与正文冲突或本构图容易误生成的东西。可为空。',
+};
+
+/** 一次负面拼接的输入。 */
+export interface NegativeLayerSource {
+  /** 固定负面(渠道页「固定负面」那一格)。 */
+  builtin?: string;
+  /** AI 动态负面(本画面专用,可空)。 */
+  dynamic?: string;
+}
+
+export interface NegativeLayerOptions {
+  /** 层间连接符,默认 `', '`。 */
+  separator?: string;
+  /** 是否跨段去重(按 `tagKey` 归一后比),默认 true。 */
+  dedupe?: boolean;
+  /** tag 数上限;0 = 不限。超了从**末段末尾**开始砍,即先砍动态词。 */
+  budget?: number;
+}
+
+export interface NegativeLayer {
+  id: NegativeLayerId;
+  label: string;
+  /** 本段最终进成品的文本。 */
+  text: string;
+  tagCount: number;
+  chars: number;
+  /** 被预算砍掉了一部分。 */
+  truncated: boolean;
+  note?: string;
+}
+
+export interface NegativeLayersResult {
+  /** 恒为 2 条,顺序固定 固定负面 → 本图排除。 */
+  layers: NegativeLayer[];
+  /** 拼好的成品串。 */
+  text: string;
+  chars: number;
+  tagCount: number;
+  /** 动态段里与固定段重复而被吸收的 tag 数。 */
+  droppedDuplicates: number;
+  /** 因预算被砍掉的 tag 数。 */
+  droppedByBudget: number;
+  /** 负面不可拖顺序,这里恒等于 NEGATIVE_LAYER_ORDER;回传是为了与 PromptLayersResult 同形。 */
+  order: NegativeLayerId[];
+}
+
+/**
+ * 负面两段一起算。**全链路唯一的负面拼接实现**,与正向的 buildPromptLayers 对称:
+ * 后端组装(composeNegative)、UI 预览、随图记录都调它。
+ *
+ * 默认 dedupe=true 的理由:AI 偶尔会把固定负面里的 lowres 又写一遍,重复不改变采样结果
+ * 但会白白吃掉预算额度。budget 只砍动态段 —— 固定负面是用户自己定的基线,不该被系统动。
+ */
+export function buildNegativeLayers(
+  source: NegativeLayerSource,
+  options: NegativeLayerOptions = {},
+): NegativeLayersResult {
+  const separator = options.separator ?? DEFAULT_SEPARATOR;
+  const dedupe = options.dedupe !== false;
+  const budget = Math.max(0, Math.floor(Number(options.budget) || 0));
+  const order = [...NEGATIVE_LAYER_ORDER];
+
+  const rawParts: Record<NegativeLayerId, string[]> = {
+    builtin: [String(source.builtin ?? '')],
+    dynamic: [String(source.dynamic ?? '')],
+  };
+
+  const seen = new Set<string>();
+  const kept: Record<NegativeLayerId, string[]> = { builtin: [], dynamic: [] };
+  let droppedDuplicates = 0;
+  for (const id of order) {
+    for (const part of rawParts[id]) {
+      for (const tag of splitTags(part)) {
+        if (dedupe) {
+          const key = tagKey(tag);
+          if (key && seen.has(key)) {
+            droppedDuplicates += 1;
+            continue;
+          }
+          if (key) seen.add(key);
+        }
+        kept[id].push(tag);
+      }
+    }
+  }
+
+  // 预算只砍动态段末尾;动态段砍空了仍不够就停手,不碰固定负面。
+  let droppedByBudget = 0;
+  if (budget > 0) {
+    const total = kept.builtin.length + kept.dynamic.length;
+    let excess = total - budget;
+    while (excess > 0 && kept.dynamic.length > 0) {
+      kept.dynamic.pop();
+      excess -= 1;
+      droppedByBudget += 1;
+    }
+  }
+
+  const layers: NegativeLayer[] = order.map(id => {
+    const tags = kept[id];
+    const text = tags.join(separator);
+    const rawCount = rawParts[id].reduce((sum, part) => sum + splitTags(part).length, 0);
+    const truncated = droppedByBudget > 0 && tags.length < rawCount;
+    const notes: string[] = [];
+    if (truncated) notes.push(`超出 tag 预算,砍掉 ${rawCount - tags.length} 个`);
+    if (rawCount > 0 && tags.length === 0) notes.push('全部被固定负面的重复项吸收');
+    return {
+      id,
+      label: NEGATIVE_LAYER_LABELS[id],
+      text,
+      tagCount: tags.length,
+      chars: text.length,
+      truncated,
+      note: notes.length ? notes.join('；') : undefined,
+    };
+  });
+
+  const text = layers
+    .map(layer => layer.text)
+    .filter(Boolean)
+    .join(separator);
+
+  return {
+    layers,
+    text,
+    chars: text.length,
+    tagCount: layers.reduce((sum, layer) => sum + layer.tagCount, 0),
+    droppedDuplicates,
+    droppedByBudget,
+    order,
+  };
+}
+
+/** 只要负面成品串(后端组装用这个)。 */
+export function composeNegativeLayers(
+  source: NegativeLayerSource,
+  options: NegativeLayerOptions = {},
+): string {
+  return buildNegativeLayers(source, options).text;
 }
 
 /**
