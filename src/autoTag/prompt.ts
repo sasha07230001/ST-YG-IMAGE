@@ -35,6 +35,7 @@ import {
   settings,
 } from '@/state/settings';
 import { renderTemplate } from '@/relay/prompt';
+import { injectPurgeCore, purgeCoreText } from '@/relay/purgeCore';
 
 /**
  * 本次自动 tag 的协议形态。按默认后端与其开关算**一次**,写协议(本模块)与验收/收尾
@@ -68,6 +69,21 @@ export function autoTagProfile(): AutoTagProfile {
   const lock = activeOrientationLock();
   const mode: TagPromptMode = settings.autoTag.prompts?.mode === 'relay' ? 'relay' : 'builtin';
   return { naiCharPrompts, nl, lockedSize: lock === 'auto' ? null : lock, mode };
+}
+
+/**
+ * 取本次请求该压在最前面的 dsh-purge 内核正文。
+ *
+ * 优先级:自定义正文(非空) > 所选预设 > 空串。
+ * `purgeCoreOn` 是总闸,关掉就一律空串 —— 这样调用点只判一个返回值有没有内容,
+ * 不必在两条链里各写一遍「开关关了没」。
+ */
+export function activePurgeCore(): string {
+  const p = settings.autoTag.prompts;
+  if (!p?.purgeCoreOn) return '';
+  const custom = String(p.purgeCoreCustom ?? '').trim();
+  if (custom) return custom;
+  return purgeCoreText(p.purgeCorePreset);
 }
 
 /** 该楼「显式指定方向的画幅提示语」——中转站没有横竖自动判定,方向直接给它。 */
@@ -267,7 +283,10 @@ async function buildRelayMessages(
       `可选位置 ID:${positions}\n` +
       `画幅:${orientationNote(profile.lockedSize)}`,
   });
-  return messages;
+  // dsh-purge 内核压在整条链最外层:它要包住破限词、角色卡、世界书、协议 —— 任何一段
+  // 被模型读成「这是内容审查请求」的材料都必须在内核之下。放在返回值处统一套,
+  // 是因为这条链的三种请求(常规/单槽重写/分段)都从这里出去,中途加会漏掉分支。
+  return injectPurgeCore(messages, activePurgeCore());
 }
 
 export async function buildAutoTagMessages(
@@ -470,5 +489,7 @@ ${characterRule}
   const taskBlock = taskNote?.trim() ? `${taskNote.trim()}\n\n` : '';
   const userContent = `${memoryText}\n\n${libraryBlock}\n\n${taskBlock}${previous ? `${previous}\n\n` : ''}--- 目标正文｜${roleLabel(context, targetFloor)} ---\n${preparedTarget.promptText}`;
   messages.push({ role: 'user', content: userContent });
-  return messages;
+  // 与 relay 链同一个收口:内核压最外层,包住破限词/角色卡/主角设定/世界书/规范/协议。
+  // 两处都调 injectPurgeCore 而不是各拼一次,是为了让「谁在最前面」只有一个定义。
+  return injectPurgeCore(messages, activePurgeCore());
 }

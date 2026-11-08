@@ -3,9 +3,9 @@
   "loading_order": 100,
   "requires": [],
   "optional": [],
-  "js": "dist/index.js?ver=0.4.2",
+  "js": "dist/index.js?ver=0.5.0",
   "author": "YG",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "homePage": "https://github.com/sasha07230001/ST-YG-IMAGE",
   "auto_update": false,
   "minimum_client_version": "1.12.13"

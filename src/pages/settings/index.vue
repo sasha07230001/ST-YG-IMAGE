@@ -6,6 +6,7 @@ import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { fetchModels, testChannel } from '@/api/client';
+import { PURGE_CORE_PRESETS, purgeCoreText, type PurgeCorePreset } from '@/relay/purgeCore';
 import {
   BACKENDS,
   DEFAULT_COMFY_SPEC,
@@ -155,8 +156,7 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
     hint: '作为置顶 system 附加在自动 tag 请求里，降低副 API 拒答率。留空则用内置默认（与柏宝书同款文本）。全后端通用。',
     builtin: DEFAULT_JAILBREAK_PROMPT,
     macros: [],
-  },
-  {
+  },  {
     key: 'naiV5Spec',
     label: 'NAI \u89c4\u8303',
     hint: '\u9ed8\u8ba4\u540e\u7aef\u4e3a NAI \u65f6\u62fc\u8fdb\u81ea\u52a8 tag \u8bf7\u6c42\uff0c\u5b9a\u4e49 Base Prompt\u3001\u539f\u751f Character Prompts \u4e0e\u82f1\u6587\u81ea\u7136\u8bed\u8a00\uff08nl \u4e00\u5f8b\u5199\u82f1\u6587\uff09\u30024.5 \u4e0e V5 \u5171\u7528\u8fd9\u4e00\u4efd\uff1achar_captions \u672c\u5c31\u662f v4 \u65f6\u4ee3\u7684\u534f\u8bae\uff0c\u4e24\u4ee3\u5199\u6cd5\u53e3\u5f84\u76f8\u540c\u3002{{#nl}}\u2026{{/nl}} \u4e4b\u95f4\u7684\u5185\u5bb9\u53ea\u5728 NAI \u9762\u677f\u5f00\u542f\u300c\u751f\u6210\u81ea\u7136\u8bed\u8a00\u300d\u65f6\u4fdd\u7559\uff0c{{^nl}}\u2026{{/nl}} \u4e4b\u95f4\u7684\u53ea\u5728\u5173\u95ed\u65f6\u4fdd\u7559\u3002\u7559\u7a7a\u7528\u5185\u7f6e\u9ed8\u8ba4\u3002',
@@ -216,6 +216,68 @@ const visibleTagPrompts = computed(() => {
     relayMode ? m.key === 'jailbreak' : m.key !== 'relaySystem' && m.key !== 'relaySpec',
   );
 });
+
+/* —— dsh-purge 强制破甲内核(跨链指令权威层,与上面那组单链提示词分开管) ——
+   为什么不塞进 TAG_PROMPT_METAS:那个列表每一项都是「一条 system、由某条链读取」,
+   而内核是**两条链共同的收口**,还有自己的预设下拉与自启开关。混在一起后
+   visibleTagPrompts 的过滤条件就要写成三元套二元,再过两周没人看得懂它在筛什么。 */
+
+// 预设下拉按 BbiSelect 的 string 口径收发,这里收窄回联合类型
+const purgeCorePresetSel = computed<string>({
+  get: () => settings.autoTag.prompts.purgeCorePreset,
+  set: v => {
+    settings.autoTag.prompts.purgeCorePreset = v as PurgeCorePreset;
+    // 换到「关闭」= 立刻切断;换到任何一套实际正文 = 顺手接上。
+    // 不这么做的话,用户选了一套预设却发现「未启用」一点没变,得再点一次开关。
+    settings.autoTag.prompts.purgeCoreOn = v !== 'off';
+  },
+});
+const PURGE_CORE_OPTIONS = PURGE_CORE_PRESETS.map(p => ({ value: p.id, label: p.label }));
+const purgeCoreHint = computed(
+  () => PURGE_CORE_PRESETS.find(p => p.id === settings.autoTag.prompts.purgeCorePreset)?.hint ?? '',
+);
+const purgeCoreScale = computed(
+  () => PURGE_CORE_PRESETS.find(p => p.id === settings.autoTag.prompts.purgeCorePreset)?.scale ?? '',
+);
+// 实际生效的正文长度:自定义优先,否则预设,都没有就是 0(UI 据此报「空壳已开」)
+const purgeCoreChars = computed(() => {
+  const p = settings.autoTag.prompts;
+  const custom = p.purgeCoreCustom.trim();
+  return custom ? custom.length : purgeCoreText(p.purgeCorePreset).length;
+});
+const purgeCoreConfigured = computed(() => {
+  const p = settings.autoTag.prompts;
+  return p.purgeCoreOn && purgeCoreChars.value > 0;
+});
+const purgeCoreEditing = ref(false);
+const purgeCoreDraft = ref('');
+const purgeCoreArea = ref<InstanceType<typeof BbiTextarea> | null>(null);
+
+function openPurgeCoreEditor() {
+  const p = settings.autoTag.prompts;
+  purgeCoreDraft.value = p.purgeCoreCustom.trim() || purgeCoreText(p.purgeCorePreset);
+  purgeCoreEditing.value = true;
+}
+function closePurgeCoreEditor() {
+  purgeCoreEditing.value = false;
+  purgeCoreDraft.value = '';
+}
+function savePurgeCoreDraft() {
+  const p = settings.autoTag.prompts;
+  // 与内置预设逐字相同 → 存空串,回落预设。避免把几万字符的模板冗余进设置,
+  // 也避免以后改预设时这份快照悄悄压住新版(用户在不知情的情况下跑的是旧文本)。
+  const presetText = purgeCoreText(p.purgeCorePreset).trim();
+  const v = purgeCoreDraft.value.trim();
+  p.purgeCoreCustom = v && v !== presetText ? purgeCoreDraft.value : '';
+  if (p.purgeCoreCustom) p.purgeCoreOn = true;
+  closePurgeCoreEditor();
+}
+function resetPurgeCoreDraft() {
+  purgeCoreDraft.value = purgeCoreText(settings.autoTag.prompts.purgeCorePreset);
+}
+function insertPurgeCorePlaceholder(token: string) {
+  purgeCoreArea.value?.insertAtCursor(token);
+}
 
 function openTagPrompt(meta: TagPromptMeta) {
   editingTagPrompt.value = meta;
@@ -888,6 +950,69 @@ async function confirmUpdate() {
         <p v-if="settings.autoTag.prompts.mode === 'relay'" class="bbi-field-hint">
           中转站的 system 提示词与编译规范在「提示词」页里改(那里跟渠道配置放在一起,改完能原地自检)。
         </p>
+
+        <!-- dsh-purge 强制破甲内核:两条链共用、压在最外层 -->
+        <div class="bbi-purge-core">
+          <div class="bbi-purge-core-head">
+            <label class="bbi-switch-row bbi-purge-core-switch">
+              <span class="bbi-purge-core-title">强制破甲内核(dsh-purge)</span>
+              <input
+                v-model="settings.autoTag.prompts.purgeCoreOn"
+                type="checkbox"
+                class="bbi-checkbox"
+                :disabled="settings.autoTag.prompts.purgeCorePreset === 'off'"
+              />
+            </label>
+            <span
+              class="bbi-purge-core-badge"
+              :class="{
+                'is-on': purgeCoreConfigured,
+                'is-empty': settings.autoTag.prompts.purgeCoreOn && purgeCoreChars === 0,
+              }"
+            >
+              {{ purgeCoreConfigured ? `生效中 · ${purgeCoreChars} 字符` : settings.autoTag.prompts.purgeCoreOn ? '空壳(不注入)' : '未启用' }}
+            </span>
+          </div>
+
+          <p class="bbi-field-hint">
+            这一层是<strong>指令权威声明</strong>:告诉模型它是渲染环节而不是内容审查员。压在整条请求最外层——
+            破限词、角色卡、世界书、输出协议全部被它包住,所以它比链里任何一段材料优先级都高。
+            内置 LLM 链与中转站链<strong>都吃</strong>,与上面那条「破限词」是两层东西:破限词降拒答率,这一层定身份与职责边界。
+          </p>
+
+          <div class="bbi-select-row">
+            <span class="bbi-select-row-label">预设</span>
+            <BbiSelect
+              v-model="purgeCorePresetSel"
+              :options="PURGE_CORE_OPTIONS"
+              aria-label="破甲内核预设"
+            />
+          </div>
+          <p class="bbi-field-hint">{{ purgeCoreHint }}<template v-if="purgeCoreScale"> 篇幅:{{ purgeCoreScale }}。</template></p>
+
+          <label class="bbi-switch-row">
+            <span>开机自启(保留上次的开关状态)</span>
+            <input v-model="settings.autoTag.prompts.purgeCoreAutoStart" type="checkbox" class="bbi-checkbox" />
+          </label>
+          <p class="bbi-field-hint">
+            勾上后,ST 每次启动都按你上次留下的状态自动接回去,不必先进设置页。
+            关掉自启或把预设选到「关闭」都会被完整尊重 —— 不会被下次启动翻回来。
+          </p>
+
+          <div class="bbi-purge-core-actions">
+            <button class="bbi-btn" type="button" @click="openPurgeCoreEditor">
+              <Icon name="edit" /> 编辑正文{{ settings.autoTag.prompts.purgeCoreCustom.trim() ? '(已自定义)' : '' }}
+            </button>
+            <button
+              v-if="settings.autoTag.prompts.purgeCoreCustom.trim()"
+              class="bbi-btn bbi-btn-danger"
+              type="button"
+              @click="settings.autoTag.prompts.purgeCoreCustom = ''"
+            >
+              <Icon name="refresh" /> 弃用自定义
+            </button>
+          </div>
+        </div>
       </Collapsible>
     </div>
 
@@ -1161,6 +1286,48 @@ async function confirmUpdate() {
           <span class="bbi-modal-foot-spacer"></span>
           <button class="bbi-btn" type="button" @click="closeTagPrompt">取消</button>
           <button class="bbi-btn bbi-btn-primary" type="button" @click="saveTagPrompt">完成</button>
+        </footer>
+      </div>
+    </ModalMask>
+
+    <!-- ===== 破甲内核正文编辑弹窗(与上一条同构,但不挂宏、可恢复为所选预设) ===== -->
+    <ModalMask :open="purgeCoreEditing" @close="closePurgeCoreEditor">
+      <div
+        v-if="purgeCoreEditing"
+        class="bbi-modal bbi-modal-wide"
+        role="dialog"
+        aria-modal="true"
+        aria-label="编辑破甲内核正文"
+      >
+        <header class="bbi-modal-head">
+          <span class="bbi-modal-title">编辑破甲内核正文</span>
+          <button class="bbi-icon-mini" type="button" title="关闭" @click="closePurgeCoreEditor">
+            <Icon name="close" />
+          </button>
+        </header>
+
+        <p class="bbi-modal-label">
+          这段文字会成为整条请求的第一条 system,包住破限词、角色卡、世界书与输出协议。
+          留空或与所选预设逐字相同 → 回落预设(推荐,预设升级时你会跟着拿到新版)。
+          要自己写就整段替换,写多少字符就发多少字符。
+        </p>
+
+        <BbiTextarea
+          ref="purgeCoreArea"
+          v-model="purgeCoreDraft"
+          class="bbi-prompt-area"
+          :rows="16"
+          :max-rows="32"
+          mono
+        />
+
+        <footer class="bbi-modal-foot">
+          <button class="bbi-btn bbi-btn-danger" type="button" @click="resetPurgeCoreDraft">
+            <Icon name="refresh" /> 载入所选预设
+          </button>
+          <span class="bbi-modal-foot-spacer"></span>
+          <button class="bbi-btn" type="button" @click="closePurgeCoreEditor">取消</button>
+          <button class="bbi-btn bbi-btn-primary" type="button" @click="savePurgeCoreDraft">完成</button>
         </footer>
       </div>
     </ModalMask>
@@ -1603,6 +1770,62 @@ async function confirmUpdate() {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
+}
+
+/* —— 破甲内核面板:与上面那组「单链提示词」拉开距离,它是另一层东西 ——
+   用左侧一条竖线做出「包在外面」的视觉暗示:内核在请求里是最外层,
+   所以在 UI 上也让它看起来像一整个包裹块,而不是列表里的又一行。 */
+.bbi-purge-core {
+  margin-top: 18px;
+  padding: 12px 14px 14px;
+  border: 1px solid var(--bbi-line);
+  border-left: 3px solid var(--bbi-accent);
+  border-radius: var(--bbi-radius);
+  background: var(--bbi-surface-2);
+}
+.bbi-purge-core .bbi-field-hint:last-child {
+  margin-bottom: 0;
+}
+.bbi-purge-core-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.bbi-purge-core-switch {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+}
+.bbi-purge-core-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--bbi-ink);
+}
+/* 状态徽标:三种状态三种色,「空壳」用警示色 —— 开了却没内容是最该被看见的状态 */
+.bbi-purge-core-badge {
+  flex: 0 0 auto;
+  padding: 2px 9px;
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-surface);
+  color: var(--bbi-ink-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.bbi-purge-core-badge.is-on {
+  background: var(--bbi-accent-soft);
+  color: var(--bbi-accent);
+}
+.bbi-purge-core-badge.is-empty {
+  background: oklch(0.62 0.16 55 / 0.16);
+  color: oklch(0.58 0.16 55);
+}
+.bbi-purge-core-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 /* ============ 排除名单(chips + 弹窗列表):与柏宝书同款交互,类名换 bbi 前缀 ============ */

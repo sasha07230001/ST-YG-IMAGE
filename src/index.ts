@@ -8,6 +8,7 @@ import { bindCharTagSync } from '@/state/charTags';
 import { bindCharacterPromptSync, hydrateCharacterPrompts } from '@/state/characterPromptStore';
 import { initGlobalCharTags } from '@/state/globalCharTags';
 import { hydrateSettings } from '@/state/settings';
+import { bindPurgeCoreAutoStart } from '@/relay/purgeCoreBoot';
 import { ui } from '@/state/ui';
 import { guardEditableArrowKeys } from '@/st/keyboard';
 import { ensureImageTagRegexRegistered } from '@/st/imageTagRegex';
@@ -96,6 +97,9 @@ $(() => {
 async function hydrateWhenReady(attempt = 0) {
   if ((window as unknown as { SillyTavern?: { getContext?: unknown } }).SillyTavern?.getContext) {
     try {
+      // 自启订阅必须挂在这一行之前:它靠 onSettingsReady 等 hydrate 完成,
+      // 挂晚了回调已经触发过,自启就永远等不到通知(静默不生效)。
+      bindPurgeCoreAutoStart();
       await hydrateSettings();
       // 全局库必须在 bindCharTagSync 之前初始化:首次重算就要把全局条目合进派生库
       initGlobalCharTags();

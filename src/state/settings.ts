@@ -25,6 +25,7 @@ import {
   type TransientPromptState,
 } from '@/autoTag/characterPrompts';
 import { getContext } from '@/st/context';
+import type { PurgeCorePreset } from '@/relay/purgeCore';
 import { reactive, watch } from 'vue';
 
 /**
@@ -1177,6 +1178,28 @@ export interface AutoTagPrompts {
   relaySpec: string;
   /** 破限词:置顶 system,降低副 API 拒答率。 */
   jailbreak: string;
+  /**
+   * dsh-purge 强制破甲内核:跨链生效(内置 LLM 链与中转站链都吃)。
+   *
+   * 与 jailbreak 的分工:jailbreak 是「降低拒答率」的一句话档,内核是「你是谁、交付物是什么」
+   * 的指令权威层。内核压在最外层,包住后面的角色卡/世界书/协议,所以它的优先级高于链路里
+   * 任何一段可能被误读成「请求审查」的材料。
+   *
+   * 'off' = 不注入(老配置没有这个键时也落成 off,行为与升级前逐字节一致)。
+   */
+  purgeCorePreset: PurgeCorePreset;
+  /** 开机自启:开关打开时,ST 一加载本扩展就按这个开关把内核接上,不必等用户先进设置页。 */
+  purgeCoreAutoStart: boolean;
+  /** 选择「自定义」时用的正文;空串 = 回落所选预设。 */
+  purgeCoreCustom: string;
+  /**
+   * 内核总开关。
+   *
+   * 和 `purgeCorePreset` 分开存是刻意的:下拉框是「用哪套」,这个布尔是「现在接没接上」。
+   * 合成一个字段的话,用户想临时关掉再打开就得重新挑一次预设,而且预设值会被覆写掉。
+   * 开机自启只认这个布尔,不认预设 —— 预设记的是选型,不是状态。
+   */
+  purgeCoreOn: boolean;
   /** 【已下线,无 UI 入口】NAI 4 系及以下的单串 tag 规范;回落 DEFAULT_NAI_SPEC。 */
   naiSpec: string;
   /** NAI 规范(4.5/V5 的 Base Prompt + 原生 Character Prompts);设置页显示为「NAI 规范」。 */
@@ -1455,6 +1478,13 @@ function defaults(): ImageSettings {
         relaySystem: '',
         relaySpec: '',
         jailbreak: '',
+        // dsh-purge 内核默认接「国模短指令」并开机自启(用户指定口径)。
+        // 想换轻的用设置页下拉降到 generic / claude;想彻底不要就把 purgeCoreOn 关掉,
+        // 这个开关是持久化的,关一次不会被下次启动翻回来。
+        purgeCorePreset: 'cn',
+        purgeCoreOn: true,
+        purgeCoreAutoStart: true,
+        purgeCoreCustom: '',
         naiSpec: '',
         naiV5Spec: '',
         comfySpec: '',
@@ -1987,6 +2017,21 @@ function normalizeExcludes(raw: unknown): ExcludesSettings {
  * 与升级前逐字节一致:AUTO 链不会因为多了一个字段而改变画面。
  * purge 是嵌套对象,单独再兜一层 —— 用户可能只存了 total 的一半字段。
  */
+/** 
+ * dsh-purge 内核预设 id 的白名单校验。
+ *
+ * 只信白名单:localStorage 是用户手能改的地方,存进来一个 'full_v2' 之类
+ * 不该让下游 `purgeCoreText` 之外多出一条隐式分支。认不出来的 id 一律回落默认档,
+ * 而不是落到 'off' —— 用户明明选过一套,写坏一个字母就静默失效比报错更难查。
+ */
+const PURGE_CORE_IDS: PurgeCorePreset[] = ['off', 'cn', 'generic', 'claude', 'full'];
+
+function normalizePurgeCorePreset(raw: unknown, fallback: PurgeCorePreset): PurgeCorePreset {
+  return typeof raw === 'string' && (PURGE_CORE_IDS as string[]).includes(raw)
+    ? (raw as PurgeCorePreset)
+    : fallback;
+}
+
 function normalizeRelay(raw: unknown, def: RelaySettings): RelaySettings {
   const o = (raw ?? {}) as Partial<RelaySettings>;
   const str = (key: keyof RelaySettings, fallback: string) =>
@@ -2119,12 +2164,24 @@ function normalize(raw: unknown): ImageSettings {
       const legacyPrompts = rp as Partial<AutoTagPrompts> & { thinking?: unknown };
       const legacyThinking =
         typeof legacyPrompts.thinking === 'string' ? legacyPrompts.thinking : '';
+      // dsh-purge 内核:老配置没有这几个键 → 落默认(国模短指令 + 开 + 自启)。
+      // 判据用 `in` 而不是取假值:用户显式存了 purgeCoreOn:false 时必须被尊重,
+      // 不能因为「假值 = 没有」而在下次启动又被自启翻回来 —— 那是自启最烦人的那种 bug。
+      const preset = normalizePurgeCorePreset(rp.purgeCorePreset, d.autoTag.prompts.purgeCorePreset);
       return {
         // 老配置没有 mode:落回内置链,画面口径与升级前完全一致(中转站要用户主动切)
         mode: rp.mode === 'relay' ? 'relay' : 'builtin',
         relaySystem: typeof rp.relaySystem === 'string' ? rp.relaySystem : '',
         relaySpec: typeof rp.relaySpec === 'string' ? rp.relaySpec : '',
         jailbreak: typeof rp.jailbreak === 'string' ? rp.jailbreak : legacyJailbreak,
+        purgeCorePreset: preset,
+        purgeCoreOn: typeof rp.purgeCoreOn === 'boolean' ? rp.purgeCoreOn : preset !== 'off',
+        purgeCoreAutoStart:
+          typeof rp.purgeCoreAutoStart === 'boolean'
+            ? rp.purgeCoreAutoStart
+            : d.autoTag.prompts.purgeCoreAutoStart,
+        purgeCoreCustom:
+          typeof rp.purgeCoreCustom === 'string' ? rp.purgeCoreCustom : '',
         naiSpec: typeof rp.naiSpec === 'string' ? rp.naiSpec : '',
         naiV5Spec: typeof rp.naiV5Spec === 'string' ? rp.naiV5Spec : '',
         comfySpec: typeof rp.comfySpec === 'string' ? rp.comfySpec : '',
@@ -2168,7 +2225,31 @@ function applyInto(target: ImageSettings, src: ImageSettings): void {
   target.relay = src.relay;
   target.channels = src.channels;
   target.assignments = src.assignments;
-  target.autoTag = src.autoTag;
+  target.autoTag.enabled = src.autoTag.enabled;
+  target.autoTag.contextMessages = src.autoTag.contextMessages;
+  target.autoTag.minImages = src.autoTag.minImages;
+  target.autoTag.maxImages = src.autoTag.maxImages;
+  target.autoTag.retryCount = src.autoTag.retryCount;
+  target.autoTag.autoGenerate = src.autoTag.autoGenerate;
+  target.autoTag.transientAutoRead = src.autoTag.transientAutoRead;
+  // prompts 逐字段赋,不能整块替换:整块换上来的是 normalize 新建的普通对象,
+  // 换进 reactive 根时会再包一层 —— 设置页的 v-model 写着写着就和设置真身分家了。
+  const tp = src.autoTag.prompts;
+  const dp = target.autoTag.prompts;
+  dp.mode = tp.mode;
+  dp.relaySystem = tp.relaySystem;
+  dp.relaySpec = tp.relaySpec;
+  dp.jailbreak = tp.jailbreak;
+  dp.purgeCorePreset = tp.purgeCorePreset;
+  dp.purgeCoreOn = tp.purgeCoreOn;
+  dp.purgeCoreAutoStart = tp.purgeCoreAutoStart;
+  dp.purgeCoreCustom = tp.purgeCoreCustom;
+  dp.naiSpec = tp.naiSpec;
+  dp.naiV5Spec = tp.naiV5Spec;
+  dp.comfySpec = tp.comfySpec;
+  dp.comfyThinking = tp.comfyThinking;
+  dp.naiThinking = tp.naiThinking;
+  dp.naiV5Thinking = tp.naiV5Thinking;
   target.excludes = src.excludes;
   target.storage = src.storage;
 }

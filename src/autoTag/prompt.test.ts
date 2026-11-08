@@ -21,6 +21,12 @@ function prompts(overrides: Partial<AutoTagPrompts> = {}): AutoTagPrompts {
     relaySystem: '',
     relaySpec: '',
     jailbreak: '',
+    // 破甲内核:用例默认必须关。开着的话每条构建请求前都会多压一大段 system,
+    // 后面所有「第 N 条消息是什么」的断言会整体错位 —— 而且错得很像真 bug。
+    purgeCorePreset: 'off',
+    purgeCoreOn: false,
+    purgeCoreAutoStart: false,
+    purgeCoreCustom: '',
     naiSpec: '',
     naiV5Spec: '',
     comfySpec: '',
@@ -427,7 +433,12 @@ describe('auto tag prompt', () => {
       expect(text).toContain('若正文明确为显式 NSFW 场景');
       expect(text).toContain('若本图是显式 NSFW 场景');
       expect(text).not.toContain('若本图协议含 negative 键');
-      expect(text).not.toContain('成年人');
+      // 「成年人」这条只钉 NAI 规范与思维链:它们不该把 NSFW 条款限定成仅限成年角色。
+      // 不能用整条消息链去断言 —— 破限词(settings.ts 的 DEFAULT_JAILBREAK_PROMPT)
+      // 与破甲内核(relay/purgeCore.ts)本来就写着成年人的年龄边界,那不是回归,是另一层的东西。
+      // 内核经 injectPurgeCore 拼进第一条 system,所以要从第 2 条往后找 spec 与 thinking。
+      const nai4Chain = (await buildAutoTagMessages(context(), 1, options, null)).map(m => m.content);
+      expect(nai4Chain.slice(1).join('\n')).not.toContain('成年人');
       // NAI 侧用户没有白痘问题,不引入这条禁令。
       expect(text).not.toContain('白皙肤色词');
       expect(text).not.toContain('白皙词一律禁止');
@@ -435,15 +446,15 @@ describe('auto tag prompt', () => {
       // NAI V5:身份 tag 落点是 characters[].tag 首位;NSFW 按 Base/角色块分工;
       // contentRule 明令禁止 negative tags,不该有 negative 条件自查。
       settings.nai.model = 'nai-diffusion-5-full';
-      text = (await buildAutoTagMessages(context(), 1, options, null))
-        .map(m => m.content)
-        .join('\n');
+      const v5msgs = await buildAutoTagMessages(context(), 1, options, null);
+      const chain = v5msgs.map(m => m.content);
+      text = chain.join('\n');
       expect(text).toContain('身份 tag 必须写进档案');
       expect(text).toContain('每个同人角色的身份 tag 都逐字照抄自档案 fandom 字段');
       expect(text).toContain('若正文明确为显式 NSFW 场景');
       expect(text).toContain('若本图是显式 NSFW 场景');
       expect(text).not.toContain('若本图协议含 negative 键');
-      expect(text).not.toContain('成年人');
+      expect(chain.slice(1).join('\n')).not.toContain('成年人');
       expect(text).not.toContain('白皙肤色词');
     } finally {
       settings.defaultBackend = oldBackend;
