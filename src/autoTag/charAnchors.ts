@@ -8,6 +8,7 @@ import {
   type CharTagField,
 } from '@/state/charTags';
 import { getTagGenChannel } from '@/state/settings';
+import type { ProfileFields } from '@/state/charProfiles';
 
 /**
  * 角色固定外貌库的「锚定」侧。
@@ -66,21 +67,38 @@ export function buildAnchorText(entries: CharTagEntry[], lockedNames?: ReadonlyS
 
 /* ============ 中文外貌 → 结构化字段 的批量转换 ============ */
 
-const CONVERT_SPEC = `你是外貌 tag 转换器。把给出的角色中文外貌描述拆成固定字段的 danbooru 短 tag:英文小写、逗号分隔、多词用空格连接(不要用下划线)。
+const CONVERT_SPEC = `你是角色档案转换器。用户会用**口语**描述一个角色(可能是中文、夹着形容词和琐碎细节),你要把它拆成固定字段的 danbooru 短 tag:英文小写、逗号分隔、多词用空格连接(不要用下划线、不要加权重括号)。
 
-字段与示例:
-- sex(性别):1girl / 1boy / androgynous 等
-- hair(头发):long black hair / short silver hair 等
-- eyes(眼睛):red eyes / blue eyes 等
-- skin(肤色):tan / dark skin 等(没提就留空;白皙是默认肤色,不需要记录)
-- body(体型):petite / tall / slim / small breasts 等
-- extra(标志特征):heterochromia / scar on cheek / pointy ears 等(没提就留空)
+字段与要求:
+- name(角色名):从描述里取;用户没说就留空字符串,由界面上的名字那一格接管。
+- sex(性别):1girl / 1boy / androgynous 等。年龄线索换算成 loli / teen / milf 之类,成年默认不写。
+- hair(头发):必须同时给颜色与长度/发型,如 silver hair, long hair, low ponytail。
+- eyes(眼睛):瞳色优先,如 red eyes。描述没提就留空。
+- skin(肤色):pale skin / tan / dark skin;白皙是默认,没提可留空。
+- body(体型):petite / tall / slim / large breasts / wide hips 等,按描述写。
+- extra(标志特征):刺青、疤痕、异色瞳、泪痣、尖耳这类长期不变的东西。
+- outfit(整体印象):如 gothic lolita、school uniform、bunny suit。只有一句话式的整体风格才写这里。
+- top(上衣):shirt / hoodie / sailor collar / crop top / tank top。
+- inner(内衣):bra / sports bra / lace bra / no bra。
+- panties(内裤):panties / lace-trimmed panties / no panties / thigh strap。
+- bottom(下装):pleated skirt / jeans / shorts / hakama。
+- socks(袜子):pantyhose / black thighhighs / knee socks / garter belt。透明度与颜色必须写清。
+- shoes(鞋子):sneakers / mary janes / boots / barefoot。
+- special(特殊槽位):披肩、围巾、腰带、项圈、腰带束具,以及**塞进体内的道具**——vibrator、anal plug、egg vibrator、remote control 这类。有就照写,别回避。
+- accHand(饰品·手部):ring / bracelet / gloves / handcuffs。
+- accNeck(饰品·首部):necklace / choker / earrings / hairpin / veil。
+- accFoot(饰品·足部):anklet / toe ring / bare feet ornament。
+- accBreast(饰品·乳部):breast piercing / pasties / nipple clamps / breast harness。
+- accPussy(饰品·阴部):clit piercing / pussy jewelry。
 
 规则:
-1. 只提取固定基础特征;服装、饰品、状态、表情、动作、场景一律不写。
-2. hair 与 eyes 是二次元角色身份锚点：描述里只要出现发色、发型/长度或瞳色线索就必须写入对应字段，不得遗漏或塞进 extra；hair 尽量同时保留颜色和长度/发型，eyes 保留颜色。
-3. 描述里没提的细节不要脑补,对应字段留空字符串。
-4. 只返回一个 JSON 对象:{"角色名":{"sex":"...","hair":"...","eyes":"...","skin":"...","body":"...","extra":"..."}},键与输入的角色名完全一致;不要 Markdown 代码块、不要解释。`;
+1. **妆容、表情、动作、场景、情绪一律不写** —— 那些属于每楼变化的 state,不是档案。
+2. 用户写了哪一格就填哪一格;没提的格子**留空字符串**,不要脑补。
+3. 同一件东西只写进最具体的那个槽位,不要既写 inner 又写 outfit。
+4. 穿戴描写要**具体到类型、颜色、材质、长度/透明度**:"黑色蕾丝内裤"→"black lace-trimmed panties",不要只写"underwear"。
+5. 只返回一个 JSON 对象:
+{"name":"角色名","sex":"1girl","hair":"silver hair, long hair","eyes":"red eyes","skin":"","body":"petite","extra":"","outfit":"","top":"white shirt","inner":"black lace bra","panties":"black lace-trimmed panties","bottom":"pleated skirt","socks":"black pantyhose","shoes":"mary janes","special":"","accHand":"","accNeck":"silver necklace","accFoot":"","accBreast":"","accPussy":""}
+不要 Markdown 代码块、不要解释、不要在 JSON 前后写任何字。`;
 
 /** 字段值清洗:换行压成空格、剥 bbi_image 系子标签字面量(防止污染注入格式)。 */
 function sanitizeTagValue(value: unknown): string {
@@ -90,77 +108,108 @@ function sanitizeTagValue(value: unknown): string {
   return text;
 }
 
-/** 从模型回复中解析 {角色名: {字段: tag}}(宽容:带代码块/前后杂质也能解)。 */
-export function parseConvertedTags(raw: string): Record<string, Partial<Record<CharTagField, string>>> {
+/** 从回复里抠出第一个 JSON 对象(容忍 think 块、代码块与前后废话)。 */
+function firstJsonObject(raw: string): unknown {
   const cleaned = raw.replace(/<think(?:ing)?\b[\s\S]*?<\/think(?:ing)?>/gi, '');
-  const candidates: string[] = [cleaned.trim()];
-  for (const match of cleaned.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
-    candidates.unshift(match[1].trim());
-  }
+  const candidates: string[] = [];
+  for (const match of cleaned.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) candidates.push(match[1].trim());
+  candidates.push(cleaned.trim());
   for (const candidate of candidates) {
     const start = candidate.indexOf('{');
     const end = candidate.lastIndexOf('}');
     if (start < 0 || end <= start) continue;
     try {
       const value: unknown = JSON.parse(candidate.slice(start, end + 1));
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        const out: Record<string, Partial<Record<CharTagField, string>>> = {};
-        for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
-          const name = key.trim();
-          if (!name || !v || typeof v !== 'object' || Array.isArray(v)) continue;
-          const fields: Partial<Record<CharTagField, string>> = {};
-          for (const f of CHAR_TAG_FIELDS) {
-            const tag = sanitizeTagValue((v as Record<string, unknown>)[f]);
-            if (tag) fields[f] = tag;
-          }
-          if (Object.keys(fields).length) out[name] = fields;
-        }
-        return out;
-      }
+      if (value && typeof value === 'object' && !Array.isArray(value)) return value;
     } catch {
       // 试下一个候选
     }
   }
-  return {};
+  return null;
 }
 
-export interface ConvertedChar {
+/** 把一层对象洗成字段集合;空值全丢,只留真的写了字的格子。 */
+function fieldsOf(raw: unknown): Partial<ProfileFields> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Partial<ProfileFields> = {};
+  for (const field of CHAR_TAG_FIELDS) {
+    const tag = sanitizeTagValue((raw as Record<string, unknown>)[field]);
+    if (tag) out[field] = tag;
+  }
+  return out;
+}
+
+export interface ParsedProfile {
+  /** 模型从描述里认出的名字;没认出来就是空串,由界面已有的名字接管。 */
   name: string;
-  desc: string;
-  fields: Partial<Record<CharTagField, string>>;
+  fields: Partial<ProfileFields>;
+  /** 整串 tag:模型另外给了一整句时才用。 */
+  raw: string;
+  /** 一句自然语言外貌描述(NAI 用),没给就是空串。 */
+  nl: string;
 }
 
 /**
- * 批量把中文外貌转成结构化字段。一次请求转换所有待办角色。
- * 渠道与自动 tag 主流程同口径:指派渠道优先,未指派跟随主 API。
- * 返回成功转换的条目;整体失败(请求异常)向上抛,调用方 catch 后降级。
+ * 解析口语描述转换结果。
  *
- * 只服务角色档案页的「从柏宝书生成」按钮 —— 那是用户主动点的一次性动作。
- * 自动 tag 主流程不再调它:建档由主请求在同一次输出里完成(见文件头)。
+ * 兼容两种形状:新契约的单角色扁平对象(带 name),以及旧的多角色
+ * `{"角色名":{字段…}}` —— 后者取第一条也能用,用户不会因为版本差异填不出格子。
  */
-export async function generateCharTags(
-  chars: Array<{ name: string; desc: string }>,
+export function parseProfileDraft(raw: string): ParsedProfile {
+  const value = firstJsonObject(raw);
+  if (!value) return { name: '', fields: {}, raw: '', nl: '' };
+  const obj = value as Record<string, unknown>;
+
+  const own = fieldsOf(obj);
+  const hasOwnFields = Object.keys(own).length > 0;
+  if (hasOwnFields) {
+    return {
+      name: sanitizeTagValue(obj.name),
+      fields: own,
+      raw: sanitizeTagValue(obj.raw),
+      nl: sanitizeTagValue(obj.nl),
+    };
+  }
+
+  for (const [key, inner] of Object.entries(obj)) {
+    const fields = fieldsOf(inner);
+    if (Object.keys(fields).length) {
+      return { name: sanitizeTagValue(key), fields, raw: '', nl: '' };
+    }
+  }
+  // 一条字段都没有:名字与整串照样保留 —— 用户可能只想让 AI 从口语里认出这个人叫什么,
+  // 或者把整句原样落进 raw 那一格,这比丢掉整次转换有用。
+  return { name: sanitizeTagValue(obj.name), fields: {}, raw: sanitizeTagValue(obj.raw), nl: sanitizeTagValue(obj.nl) };
+}
+
+/**
+ * 把一段口语描述转成档案草稿。一次请求只转一个角色 —— 用户点的是"这一条"的转化按钮,
+ * 批量反而会让模型把几个人的穿戴混在一起。
+ *
+ * 渠道与自动 tag 主流程同口径:指派渠道优先,未指派跟随主 API。
+ * 请求异常向上抛,调用方 catch 后提示用户(不静默丢描述)。
+ */
+export async function convertProfileFromText(
+  text: string,
   signal?: AbortSignal,
-): Promise<ConvertedChar[]> {
-  if (!chars.length) return [];
+  nameHint = '',
+): Promise<ParsedProfile> {
+  const story = String(text ?? '').trim();
+  if (!story) return { name: '', fields: {}, raw: '', nl: '' };
   const messages: ChatMsg[] = [
     { role: 'system', content: CONVERT_SPEC },
     {
       role: 'user',
-      content: chars.map(c => `- ${c.name}: ${c.desc}`).join('\n'),
+      content: nameHint.trim()
+        ? `角色名:${nameHint.trim()}\n描述:${story}`
+        : `描述:${story}`,
     },
   ];
   const channel = getTagGenChannel();
   const raw = channel
-    ? await requestCompletion(channel, messages, { signal, source: '角色外貌转换' })
-    : await requestViaMainApi(messages, { signal, source: '角色外貌转换' });
-  const parsed = parseConvertedTags(raw);
-  const out: ConvertedChar[] = [];
-  for (const c of chars) {
-    const fields = parsed[c.name];
-    if (fields) out.push({ name: c.name, desc: c.desc, fields });
-  }
-  return out;
+    ? await requestCompletion(channel, messages, { signal, source: '角色档案转换' })
+    : await requestViaMainApi(messages, { signal, source: '角色档案转换' });
+  return parseProfileDraft(raw);
 }
 
 /* ============ 主流程入口 ============ */

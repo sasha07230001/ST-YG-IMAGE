@@ -90,6 +90,21 @@ beforeEach(() => {
   void settings;
 });
 
+/**
+ * 内存里的本聊天档案是 chatMetadata 的**缓存**,而 `ensureChatProfiles()` 每次都会重读
+ * (启动时 chatMetadata 可能还没到,只读一次就会把空数组锁进缓存)。测试里直接改
+ * `chatProfiles.entries` 等于改缓存,下一次重读就被磁盘那份覆盖 —— 所以统一走
+ * 这个函数:先写 chatMetadata,再让缓存重读,两步都做才对得上真实运行顺序。
+ */
+function seedChatProfiles(entries: ChatProfile[]): void {
+  const ctxNow = ctx as unknown as { chatMetadata: Record<string, unknown> };
+  ctxNow.chatMetadata.yg_char_profiles = {
+    schemaVersion: 1,
+    entries: JSON.parse(JSON.stringify(entries)) as ChatProfile[],
+  };
+  hydrateChatProfiles();
+}
+
 describe('档案库:只读给 AI,用户手动维护', () => {
   it('写入档案库落在 extensionSettings,不动本聊天档案', () => {
     upsertProfile(profile('小雪', { keywords: ['小雪', '雪'] }));
@@ -297,6 +312,8 @@ describe('角色层取词', () => {
       fields: emptyProfileFields(),
       raw: '',
       nl: '',
+      state: '',
+      mine: '',
       matched: [],
       floor: 0,
       at: 0,

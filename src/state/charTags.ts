@@ -13,7 +13,38 @@ import { reactive } from 'vue';
  * charTagLib 只是响应式派生缓存:合并基线(本聊天优先,全局补同名空缺) + 按楼层物理顺序重放自动变化。
  */
 
-export type CharTagField = 'fandom' | 'sex' | 'hair' | 'eyes' | 'skin' | 'body' | 'extra' | 'outfit';
+/**
+ * 角色外观字段。
+ *
+ * 分两类:
+ * - **不变的外貌**:fandom / sex / hair / eyes / skin / body / extra(标志特征) —— 建档时写一次。
+ * - **默认的样子**:outfit(笼统的着装印象) + 一串细分槽位(top/inner/panties/bottom/socks/
+ *   shoes/special,以及饰品按部位拆的 hand/neck/foot/nip/pussy)。AI 每楼改的是本聊天档案里的
+ *   `state`,但用户手写模板时这些槽位能让"黑色蕾丝内裤"落到具体一格,而不是糊在一整串里。
+ *
+ * 顺序即拼接顺序:先人,再默认穿戴,再饰品,最后特殊槽位 —— 与 danbooru 的写法习惯一致。
+ */
+export type CharTagField =
+  | 'fandom'
+  | 'sex'
+  | 'hair'
+  | 'eyes'
+  | 'skin'
+  | 'body'
+  | 'extra'
+  | 'outfit'
+  | 'top'
+  | 'inner'
+  | 'panties'
+  | 'bottom'
+  | 'socks'
+  | 'shoes'
+  | 'special'
+  | 'accHand'
+  | 'accNeck'
+  | 'accFoot'
+  | 'accBreast'
+  | 'accPussy';
 
 export const CHAR_TAG_FIELDS: readonly CharTagField[] = [
   'fandom',
@@ -24,6 +55,44 @@ export const CHAR_TAG_FIELDS: readonly CharTagField[] = [
   'body',
   'extra',
   'outfit',
+  'top',
+  'inner',
+  'panties',
+  'bottom',
+  'socks',
+  'shoes',
+  'special',
+  'accHand',
+  'accNeck',
+  'accFoot',
+  'accBreast',
+  'accPussy',
+];
+
+/** 只有穿戴相关的字段:AI 判断"哪一格属于会变的东西"时用。 */
+export const CHAR_TAG_WEAR_FIELDS: readonly CharTagField[] = [
+  'outfit',
+  'top',
+  'inner',
+  'panties',
+  'bottom',
+  'socks',
+  'shoes',
+  'special',
+  'accHand',
+  'accNeck',
+  'accFoot',
+  'accBreast',
+  'accPussy',
+];
+
+/** 饰品槽位:转换与建档时允许留空,但写出来要单独成 tag。 */
+export const CHAR_TAG_ACCESSORY_FIELDS: readonly CharTagField[] = [
+  'accHand',
+  'accNeck',
+  'accFoot',
+  'accBreast',
+  'accPussy',
 ];
 
 export const CHAR_TAG_FIELD_LABELS: Record<CharTagField, string> = {
@@ -35,10 +104,46 @@ export const CHAR_TAG_FIELD_LABELS: Record<CharTagField, string> = {
   body: '体型',
   extra: '标志特征',
   outfit: '固定着装',
+  top: '上衣',
+  inner: '内衣',
+  panties: '内裤',
+  bottom: '下装',
+  socks: '袜子',
+  shoes: '鞋子',
+  special: '特殊槽位',
+  accHand: '饰品·手部',
+  accNeck: '饰品·首部',
+  accFoot: '饰品·足部',
+  accBreast: '饰品·乳部',
+  accPussy: '饰品·阴部',
+};
+
+/** 每一格的填写提示:编辑器与"口语→提示词"转换都用它解释该落哪里。 */
+export const CHAR_TAG_FIELD_HINTS: Record<CharTagField, string> = {
+  fandom: '同人角色填 character name (copyright name); 原创留空',
+  sex: '1girl / 1boy / 2girls …',
+  hair: '发色 + 长度/发型,如 long black hair, twin tails',
+  eyes: '瞳色/眼型,如 red eyes',
+  skin: '如 pale skin, dark-skinned',
+  body: '如 petite, large breasts, wide hips',
+  extra: '长期不变的标志:scar, tattoo, heterochromia, mole under eye',
+  outfit: '整体着装印象(可选),如 gothic lolita, school uniform',
+  top: '上衣:shirt, hoodie, sailor collar, crop top',
+  inner: '内衣:bra, sports bra, no bra',
+  panties: '内裤:panties, no panties, lace-trimmed panties',
+  bottom: '下装:pleated skirt, jeans, shorts',
+  socks: '袜子:pantyhose, thighhighs, knee socks',
+  shoes: '鞋子:sneakers, mary janes, boots',
+  special: '特殊槽位:披肩、围巾、腰带、项圈,以及塞入体内的道具(如 vibrator, anal plug)',
+  accHand: '手部饰品:ring, bracelet, gloves',
+  accNeck: '首部饰品:necklace, choker, earrings, hairpin',
+  accFoot: '足部饰品:anklet, toe ring',
+  accBreast: '乳部饰品:breast piercing, pasties, nipple clamps',
+  accPussy: '阴部饰品:clit piercing, crotchless 相关饰品',
 };
 
 export type CharTagSource = 'book' | 'manual' | 'ai';
-export type CharTagHistoryField = CharTagField | 'new' | 'raw' | 'nl';
+export type CharTagHistoryField = CharTagField | 'new' | 'raw' | 'nl' | 'state';
 
 export interface CharTagChangeRecord {
   field: CharTagHistoryField;
@@ -151,7 +256,28 @@ export function lockedCharTagNames(): ReadonlySet<string> {
 }
 
 export function emptyCharFields(): Record<CharTagField, string> {
-  return { fandom: '', sex: '', hair: '', eyes: '', skin: '', body: '', extra: '', outfit: '' };
+  return {
+    fandom: '',
+    sex: '',
+    hair: '',
+    eyes: '',
+    skin: '',
+    body: '',
+    extra: '',
+    outfit: '',
+    top: '',
+    inner: '',
+    panties: '',
+    bottom: '',
+    socks: '',
+    shoes: '',
+    special: '',
+    accHand: '',
+    accNeck: '',
+    accFoot: '',
+    accBreast: '',
+    accPussy: '',
+  };
 }
 
 export function charFieldsEmpty(fields: Record<CharTagField, string>): boolean {
@@ -564,6 +690,7 @@ export function rollbackCharTag(name: string, record: CharTagChangeRecord): bool
   const next = cloneEntry(current);
   if (record.field === 'raw') next.raw = record.from;
   else if (record.field === 'nl') next.nl = record.from;
+  else if (record.field === 'state') return false;
   else next.fields[record.field] = record.from;
   next.source = 'manual';
   next.desc = '';

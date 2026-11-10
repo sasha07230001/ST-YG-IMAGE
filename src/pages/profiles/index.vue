@@ -3,9 +3,14 @@ import BbiTextarea from '@/components/BbiTextarea.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
-import { generateCharTags } from '@/autoTag/charAnchors';
+import { convertProfileFromText } from '@/autoTag/charAnchors';
 import { readBookMemory } from '@/autoTag/bookMemory';
-import { CHAR_TAG_FIELDS, CHAR_TAG_FIELD_LABELS, type CharTagField } from '@/state/charTags';
+import {
+  CHAR_TAG_FIELDS,
+  CHAR_TAG_FIELD_HINTS,
+  CHAR_TAG_FIELD_LABELS,
+  type CharTagField,
+} from '@/state/charTags';
 import {
   chatProfiles,
   listProfileBook,
@@ -51,20 +56,15 @@ interface Draft {
   fields: ProfileFields;
   raw: string;
   nl: string;
+  /** 这一刻的穿戴与身体状态:只有本聊天档案有,档案库那一层永远是模板。 */
+  state: string;
+  /** 用户追加的提示词:本聊天档案专用,AI 每楼照常更新别的格子,不动这一格。 */
+  mine: string;
   desc: string;
   enabled: boolean;
 }
 
-const FIELD_PLACEHOLDERS: Record<CharTagField, string> = {
-  fandom: '同人角色填: character name (copyright name), 不带转义括号; 原创留空',
-  sex: '如 1girl / 1boy',
-  hair: '长黑发 long black hair(必填)',
-  eyes: '红瞳 red eyes(必填)',
-  skin: '如 pale skin(可不填)',
-  body: '如 petite, small breasts',
-  extra: '如 heterochromia(可不填)',
-  outfit: '招牌着装,可不填',
-};
+/* 每格的填写提示来自字段表本身(见 charTags.CHAR_TAG_FIELD_HINTS),这里不再各写一份。 */
 
 /* ============ 草稿 ============ */
 
@@ -85,6 +85,8 @@ function emptyDraft(scope: Scope): Draft {
     fields: emptyProfileFields(),
     raw: '',
     nl: '',
+    state: '',
+    mine: '',
     desc: '',
     enabled: scope === 'book',
   };
@@ -99,6 +101,8 @@ function openBookEntry(entry: ProfileEntry) {
     fields: { ...emptyProfileFields(), ...entry.fields },
     raw: entry.raw,
     nl: entry.nl,
+    state: '',
+    mine: '',
     desc: entry.desc,
     enabled: entry.enabled,
   };
@@ -114,6 +118,8 @@ function openChatEntry(entry: ChatProfile) {
     fields: { ...emptyProfileFields(), ...entry.fields },
     raw: entry.raw,
     nl: entry.nl,
+    state: entry.state ?? '',
+    mine: entry.mine ?? '',
     desc: findProfile(entry.name)?.desc ?? '',
     enabled: true,
   };
@@ -285,7 +291,7 @@ function confirmEntry() {
     }
     const ok = updateChatProfile(
       name,
-      { fields: d.fields, raw: d.raw, nl: d.nl },
+      { fields: d.fields, raw: d.raw, nl: d.nl, state: d.state, mine: d.mine },
       currentFloor.value,
       editingName.value ? '手动编辑' : '手动建档',
     );
@@ -347,6 +353,66 @@ function askRemoveChat(entry: ChatProfile, event: Event) {
   confirmDeleteOpen.value = true;
 }
 
+/* ============ 口语描述 → 字段 ============ */
+
+/** 字段分组:一屏塞 20 个格子会看不清,分成三段,每组自带说明。 */
+const FIELD_GROUPS: Array<{ title: string; hint: string; fields: CharTagField[] }> = [
+  {
+    title: '外貌(长期不变)',
+    hint: '发色、瞳色、体型、标志。这些进每张图,不该随剧情变。',
+    fields: ['fandom', 'sex', 'hair', 'eyes', 'skin', 'body', 'extra'],
+  },
+  {
+    title: '默认着装(槽位)',
+    hint: '没换衣服时保持的样子。每楼真正的穿戴由 AI 写进本聊天档案的「此刻状态」。',
+    fields: ['outfit', 'top', 'inner', 'panties', 'bottom', 'socks', 'shoes'],
+  },
+  {
+    title: '饰品与特殊槽位',
+    hint: '按部位拆开;特殊槽位放披肩、围巾、项圈,以及塞进体内的道具。',
+    fields: ['accHand', 'accNeck', 'accFoot', 'accBreast', 'accPussy', 'special'],
+  },
+];
+
+const profileText = ref('');
+const converting = ref(false);
+
+/**
+ * 把口语描述交给模型转成字段。
+ *
+ * 只覆盖**模型真的返回了内容**的格子,用户之前手填的、描述里没提的格子保持原样 ——
+ * 否则点一次"自动转化"就等于把已经填好的东西清空。
+ */
+async function convertDraft() {
+  const d = draft.value;
+  if (!d) return;
+  const text = profileText.value.trim();
+  if (!text) {
+    toastr.info('先在上面写一段口语描述,例如「银灰长发、红色眼睛,穿黑蕾丝内裤和白色过膝袜」', 'YG 插图师');
+    return;
+  }
+  converting.value = true;
+  try {
+    const parsed = await convertProfileFromText(text, undefined, d.name.trim());
+    const filled = Object.keys(parsed.fields).length;
+    if (!filled && !parsed.name && !parsed.raw) {
+      toastr.warning('模型没有给出可用的字段,可以再点一次或手动填写', 'YG 插图师');
+      return;
+    }
+    if (!d.name.trim() && parsed.name) d.name = parsed.name;
+    d.fields = { ...d.fields, ...parsed.fields };
+    if (parsed.raw && !d.raw.trim()) d.raw = parsed.raw;
+    if (parsed.nl && !d.nl.trim()) d.nl = parsed.nl;
+    // 关键词那一格也从描述里补:名字本身一定算一个触发词。
+    if (!d.keywords.trim() && d.name.trim()) d.keywords = d.name.trim();
+    toastr.success(`已填入 ${filled} 个字段${filled ? '' : '(只认出了名字)'},检查一遍再点「完成」`, 'YG 插图师');
+  } catch (error) {
+    toastr.error(error instanceof Error ? error.message : String(error), 'YG 插图师');
+  } finally {
+    converting.value = false;
+  }
+}
+
 /* ============ 从柏宝书补字段 / 重新播种 ============ */
 
 async function regenerateFromBook() {
@@ -371,12 +437,12 @@ async function regenerateFromBook() {
       toastr.info('柏宝书最新状态里没有该角色的外貌记录,可手动填写', 'YG 插图师');
       return;
     }
-    const [result] = await generateCharTags([{ name, desc: role.desc }]);
-    if (!result) {
+    const parsed = await convertProfileFromText(role.desc, undefined, name);
+    if (!Object.keys(parsed.fields).length) {
       toastr.warning('模型没有返回该角色的 tag,请重试或手动填写', 'YG 插图师');
       return;
     }
-    d.fields = { ...emptyProfileFields(), ...result.fields };
+    d.fields = { ...emptyProfileFields(), ...parsed.fields };
     d.raw = '';
     d.desc = role.desc;
     toastr.success('已按柏宝书最新外貌填好,点「完成」保存', 'YG 插图师');
@@ -432,6 +498,8 @@ function fieldLabel(field: ChatProfileChange['field']): string {
   if (field === 'raw') return '整串';
   if (field === 'nl') return '自然语言';
   if (field === 'kw') return '关键词';
+  if (field === 'state') return '此刻状态';
+  if (field === 'mine') return '我追加的提示词';
   return CHAR_TAG_FIELD_LABELS[field];
 }
 
@@ -671,22 +739,38 @@ hydrateChatProfiles();
         </span>
 
         <div class="bbi-modal-field">
-          <span class="bbi-modal-label">初始外貌</span>
-          <div class="bbi-char-form">
-            <label
-              v-for="field in CHAR_TAG_FIELDS"
-              :key="field"
-              class="bbi-char-form-row"
-              :class="{ 'is-wide': field === 'outfit' }"
-            >
-              <span class="bbi-char-form-label">{{ CHAR_TAG_FIELD_LABELS[field] }}</span>
-              <input v-model="draft.fields[field]" class="bbi-input" :placeholder="FIELD_PLACEHOLDERS[field]" />
-            </label>
+          <span class="bbi-modal-label">口语描述 → 自动转化</span>
+          <BbiTextarea
+            v-model="profileText"
+            :rows="3"
+            :max-rows="8"
+            placeholder="用大白话写,越细越好:银灰长发扎成低马尾、红色眼睛,戴一条细银链,白衬衫外面套黑色开衫,黑色蕾丝内裤,过膝白袜配玛丽珍鞋"
+          />
+          <div class="bbi-char-convert">
+            <button class="bbi-btn" type="button" :disabled="converting" @click="convertDraft">
+              <Icon name="sparkles" /> {{ converting ? '转化中…' : '自动转化为提示词' }}
+            </button>
+            <span class="bbi-field-hint">
+              调一次模型:把这段口语拆进下面的格子(饰品按部位、着装按槽位)。**只填模型真的写了的格子**,你手填的内容不会被清掉。
+            </span>
           </div>
         </div>
-        <span class="bbi-field-hint">
-          只写<strong>长期不变</strong>的身体特征:头发、眼睛、体型、标志。穿戴、姿势、情绪由 AI 每楼写进当楼 tag,不要写进这里。
-        </span>
+
+        <div v-for="group in FIELD_GROUPS" :key="group.title" class="bbi-modal-field">
+          <span class="bbi-modal-label">{{ group.title }}</span>
+          <div class="bbi-char-form">
+            <label
+              v-for="field in group.fields"
+              :key="field"
+              class="bbi-char-form-row"
+              :class="{ 'is-wide': field === 'outfit' || field === 'special' }"
+            >
+              <span class="bbi-char-form-label">{{ CHAR_TAG_FIELD_LABELS[field] }}</span>
+              <input v-model="draft.fields[field]" class="bbi-input" :placeholder="CHAR_TAG_FIELD_HINTS[field]" />
+            </label>
+          </div>
+          <span class="bbi-field-hint">{{ group.hint }}</span>
+        </div>
 
         <label class="bbi-modal-field">
           <span class="bbi-modal-label">整串模式(可选)</span>
@@ -708,6 +792,34 @@ hydrateChatProfiles();
             mono
             placeholder="一句连贯的英文外貌描述,NAI 4.5/V5 建档时的 nl"
           />
+        </label>
+
+        <label v-if="draftScope === 'chat'" class="bbi-modal-field">
+          <span class="bbi-modal-label">此刻状态(本聊天档案)</span>
+          <BbiTextarea
+            v-model="draft.state"
+            :rows="2"
+            :max-rows="6"
+            mono
+            placeholder="这一刻的穿戴与身体状态:black lace dress, off shoulder, bare legs, wet hair"
+          />
+          <span class="bbi-field-hint">
+            AI 每楼按正文自动改写这一格(换装、弄湿、受伤、怀孕、化妆都写这里),写进角色层时排在固定外貌之后、并替换掉档案里同类的穿戴词。留空 = 这一楼按正文自己定。
+          </span>
+        </label>
+
+        <label v-if="draftScope === 'chat'" class="bbi-modal-field">
+          <span class="bbi-modal-label">我追加的提示词(不影响 AI 更新)</span>
+          <BbiTextarea
+            v-model="draft.mine"
+            :rows="2"
+            :max-rows="6"
+            mono
+            placeholder="想让她永远带着的东西,例如 always wearing a silver pendant, mole under left eye"
+          />
+          <span class="bbi-field-hint">
+            这一格只属于你:AI 每楼照常改写外貌字段与「此刻状态」,但永远不动这里。它排在固定外貌之后拼进角色层,不会因为换装被顶掉;清空即失效。
+          </span>
         </label>
 
         <label class="bbi-modal-field">
@@ -1051,6 +1163,19 @@ hydrateChatProfiles();
 
 .bbi-char-modal {
   max-width: 600px;
+}
+
+.bbi-char-convert {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.bbi-char-convert .bbi-field-hint {
+  flex: 1 1 220px;
+  margin: 0;
 }
 
 .bbi-char-form {

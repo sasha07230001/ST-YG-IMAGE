@@ -5,7 +5,7 @@ import {
   applyPositionedCharRefs,
   buildLibraryText,
   formatEntryForPrompt,
-  parseConvertedTags,
+  parseProfileDraft,
   resolveCharAnchors,
 } from '@/autoTag/charAnchors';
 import {
@@ -110,24 +110,52 @@ describe('applyCharRefs', () => {
   });
 });
 
-describe('parseConvertedTags', () => {
-  it('parses structured per-character fields', () => {
-    const raw = '{"阿黛尔":{"sex":"1girl","hair":"short silver hair","eyes":""}}';
-    expect(parseConvertedTags(raw)).toEqual({
-      阿黛尔: { sex: '1girl', hair: 'short silver hair' },
+describe('parseProfileDraft', () => {
+  it('读单角色扁平契约:字段、名字、整串、自然语言各归各位', () => {
+    const raw = JSON.stringify({
+      name: '苏白粥',
+      sex: '1girl',
+      hair: 'silver hair, long hair',
+      eyes: 'red eyes',
+      top: 'white shirt',
+      panties: 'black lace-trimmed panties',
+      special: 'anal plug',
+      accNeck: 'silver necklace',
+    });
+    const draft = parseProfileDraft(raw);
+    expect(draft.name).toBe('苏白粥');
+    expect(draft.fields).toEqual({
+      sex: '1girl',
+      hair: 'silver hair, long hair',
+      eyes: 'red eyes',
+      top: 'white shirt',
+      panties: 'black lace-trimmed panties',
+      special: 'anal plug',
+      accNeck: 'silver necklace',
     });
   });
 
-  it('tolerates code fences and surrounding prose, drops empty records', () => {
-    const raw = '好的:\n```json\n{"阿黛尔":{"hair":"silver"},"空":{"":"  "}}\n```';
-    expect(parseConvertedTags(raw)).toEqual({ 阿黛尔: { hair: 'silver' } });
+  it('仍能吃旧的多角色形状,并容忍代码块与前后废话', () => {
+    const raw = '好的:\n```json\n{"阿黛尔":{"hair":"silver hair","eyes":"red eyes"}}\n```';
+    const draft = parseProfileDraft(raw);
+    expect(draft.name).toBe('阿黛尔');
+    expect(draft.fields).toEqual({ hair: 'silver hair', eyes: 'red eyes' });
   });
 
-  it('sanitizes values with newlines or bbi tags, rejects non-object shapes', () => {
-    const raw = '{"阿黛尔":{"hair":"long\\nblack"},"坏":{"eyes":"x<bbi_image>y"},"串":{"hair":"ok"}}';
-    expect(parseConvertedTags(raw)).toEqual({ 串: { hair: 'ok' }, 阿黛尔: { hair: 'long black' } });
-    expect(parseConvertedTags('{"阿黛尔":"plain string"}')).toEqual({});
-    expect(parseConvertedTags('no json')).toEqual({});
+  it('洗完的值才留下:换行压平、bbi 子标签字面量丢弃', () => {
+    const raw = '{"name":"阿黛尔","hair":"long\\nblack hair","eyes":"x<bbi_image>y"}';
+    const draft = parseProfileDraft(raw);
+    expect(draft.fields).toEqual({ hair: 'long black hair' });
+  });
+
+  it('认不出 JSON 时返回空草稿,不抛错', () => {
+    expect(parseProfileDraft('no json')).toEqual({ name: '', fields: {}, raw: '', nl: '' });
+    expect(parseProfileDraft('{"name":"阿黛尔"}')).toEqual({
+      name: '阿黛尔',
+      fields: {},
+      raw: '',
+      nl: '',
+    });
   });
 });
 

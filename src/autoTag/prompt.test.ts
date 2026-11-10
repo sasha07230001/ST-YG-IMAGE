@@ -800,7 +800,7 @@ describe('auto tag prompt', () => {
 
     // 档案会在之后每张图被照抄,姿势/场景混进字段会让角色永远保持那个姿势
     expect(messages.some(m => m.content.includes('lying on carpet'))).toBe(true);
-    expect(messages.some(m => m.content.includes('长期不变的身体特征'))).toBe(true);
+    expect(messages.some(m => m.content.includes('只放长期不变的东西'))).toBe(true);
   });
 
   it('keeps first-appearance profiling enabled when BaiBai Book memory exists', async () => {

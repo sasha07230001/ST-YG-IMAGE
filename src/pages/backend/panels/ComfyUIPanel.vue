@@ -36,6 +36,7 @@ import PromptSendPreview from '@/components/PromptSendPreview.vue';
 import {
   basePrompt,
   hydrateCharacterPrompts,
+  characterLayerText,
   listCharacterPromptRows,
   removeBaseForChar,
   setBaseForChar,
@@ -145,14 +146,12 @@ function commitGeneral(): void {
   setBaseGeneral(generalDraft.value);
 }
 
-/** 角色层最终会发出去的那一串(与出图同一份实现)。 */
-const characterLayerText = computed(() =>
-  characterRows.value
-    .filter(row => isPresent(row.name) || !!row.effective.trim())
-    .map(row => row.effective.trim())
-    .filter(Boolean)
-    .join(', '),
-);
+/**
+ * 角色层**最终会发出去的那一串** —— 直接调 state 层的 `characterLayerText()`,
+ * 本页不再另算一遍。上一版这里自己拍了一遍「在场 or 有词就带上」,于是出现了
+ * 渠道页列着 1 个角色、旁边预览说 0 tag 的两套口径。
+ */
+const characterLayerPreview = computed(() => characterLayerText());
 
 /* ============ 分层拼接 ============ */
 
@@ -1008,9 +1007,9 @@ function applyAssist() {
                 </div>
               </div>
             </div>
-            <p v-if="characterLayerText" class="wf-layer-hint">
+            <p v-if="characterLayerPreview" class="wf-layer-hint">
               角色层成品串:
-              <code>{{ characterLayerText }}</code>
+              <code>{{ characterLayerPreview }}</code>
             </p>
           </section>
 

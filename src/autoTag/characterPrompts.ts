@@ -176,6 +176,14 @@ export interface CharacterPromptInput {
   present?: string[];
   /** 只要通用常驻词、不要任何角色级内容(公开接口调用时用它,避免悄悄带上别人的私设)。 */
   generalOnly?: boolean;
+  /**
+   * 用户自己追加的词(按角色名)。
+   *
+   * 与常驻段分开走:常驻段里既有外貌也有固定着装,换装时要按词丢掉同类穿戴;
+   * 而用户写的「永远戴那条项链」这类意志不该被一次换装顶掉。
+   * 所以这里单独一段,永远保留在原位(排在常驻之后、临时之前)。
+   */
+  pinned?: Record<string, string>;
 }
 
 export interface CharacterPromptResult {
@@ -206,18 +214,34 @@ export function composeCharacterPrompts(input: CharacterPromptInput): CharacterP
   }
 
   // 常驻:按角色名逐字匹配;只取在场者的(无人在场时不取任何角色级内容)。
-  // 该角色已有临时状态时,常驻段**整段跳过**——由后面那串临时接管。
-  // 两串同时进 CLIP 是「衣服糊成一片」的直接成因(见文件头第 2 条):
-  // 常驻写 white dress、临时写 black lace bra,采样器按 token 权重骑墙,整身都会糊。
+  // 该角色有临时状态时不做「整段跳过」:常驻串里既有外貌也有固定着装,
+  // 整段丢掉会把发色瞳色一起抹掉。改为只丢掉与临时同类的穿戴词(见 stripOutfitTags),
+  // 这样「常驻 white dress + 临时 black lace bra」不会同时进 CLIP(糊衣服的老问题),
+  // 而 long black hair、red eyes 仍然保留。
   const used: string[] = [];
   for (const name of names) {
     const text = input.base.byChar[name];
-    const takenOver =
-      input.transient.enabled &&
-      input.transient.entries.some(item => item.name === name && isUsableFragment(item.prompt));
-    if (!takenOver && isUsableFragment(text)) {
-      parts.push(cleanPromptFragment(text));
+    const transientText =
+      input.transient.enabled
+        ? cleanPromptFragment(input.transient.entries.find(item => item.name === name)?.prompt ?? '')
+        : '';
+    const kept =
+      transientText && isUsableFragment(transientText) && isUsableFragment(text)
+        ? stripOutfitTags(cleanPromptFragment(text), transientText)
+        : isUsableFragment(text)
+          ? cleanPromptFragment(text)
+          : '';
+    if (kept) {
+      parts.push(kept);
       used.push(name);
+    }
+  }
+
+  // 用户追加词:不算穿戴,不参与替换,原样排在常驻之后、临时之前。
+  if (input.pinned) {
+    for (const name of names) {
+      const text = cleanPromptFragment(input.pinned[name] ?? '');
+      if (isUsableFragment(text)) parts.push(text);
     }
   }
 
@@ -231,14 +255,60 @@ export function composeCharacterPrompts(input: CharacterPromptInput): CharacterP
       const text = cleanPromptFragment(entry.prompt);
       if (!isUsableFragment(text)) continue;
       const baseText = input.base.enabled ? cleanPromptFragment(input.base.byChar[name] ?? '') : '';
-      const index = baseText ? parts.indexOf(baseText) : -1;
-      if (index >= 0) parts.splice(index, 1, text);
-      else parts.push(text);
+      // 常驻串还在时,穿戴已经在 stripOutfitTags 里并进那一串了 —— 不再重复追加,
+      // 否则同一件衣服会出现两遍(CLIP 里重复等于加强权重,画面会被那件衣服吃掉)。
+      if (baseText && parts.some(part => part.includes(text.split(',')[0]?.trim() ?? text))) continue;
+      parts.push(text);
     }
   }
 
   // 去重(小写)+ 去空,保持顺序
   return { text: mergeTagText(...parts), names: used };
+}
+
+/**
+ * 判定一个 tag 是否属于「穿戴 / 身体状态」——也就是会被同一角色的临时状态顶掉的那部分。
+ *
+ * 为什么要判:常驻段是「外貌 + 固定着装」混成的一串(档案里的 hair/eyes 与 outfit 都拼在一起),
+ * 早先的实现在角色有了临时状态时**整段跳过**常驻段,结果换了衣服的角色连发色瞳色一起消失。
+ * 只替换穿戴相关的词,才能做到「换了衣服,人还是那个人」。
+ *
+ * 判据用词表而不是模型:这里要的是确定性 —— 出现 white dress / skirt / pantyhose /
+ * nude / wet 这类词就算穿戴,long black hair、red eyes 不算。
+ */
+const OUTFIT_WORDS = [
+  'dress', 'skirt', 'shirt', 'blouse', 'sweater', 'hoodie', 'jacket', 'coat', 'cloak', 'cape',
+  'kimono', 'yukata', 'uniform', 'suit', 'vest', 'tie', 'necktie', 'bowtie', 'ribbon', 'scarf',
+  'gloves', 'gauntlets', 'bra', 'panties', 'underwear', 'lingerie', 'bikini', 'swimsuit',
+  'leotard', 'bodysuit', 'stockings', 'pantyhose', 'thighhighs', 'socks', 'boots', 'shoes',
+  'sandals', 'heels', 'hat', 'cap', 'hood', 'mask', 'glasses', 'eyewear', 'necklace', 'choker',
+  'earrings', 'bracelet', 'ring', 'belt', 'armor', 'apron', 'robe', 'pajamas', 'nightgown',
+  'shorts', 'pants', 'trousers', 'jeans', 'leggings', 'clothes', 'outfit', 'costume', 'nude',
+  'naked', 'topless', 'bottomless', 'wet', 'soaked', 'torn', 'ripped', 'stained', 'bruise',
+  'bandage', 'wound', 'pregnant', 'sweat', 'makeup', 'lipstick', 'tattoo',
+];
+
+function isOutfitTag(tag: string): boolean {
+  const key = tag.toLowerCase();
+  return OUTFIT_WORDS.some(word => key.includes(word));
+}
+
+/** 按逗号切成 tag;保留原顺序,不做大小写或括号归一。 */
+function splitTagList(text: string): string[] {
+  return text
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+/**
+ * 临时状态给定时,常驻段里还剩什么:把常驻串切成 tag,丢掉与临时串同类的穿戴词,
+ * 其余(发色、瞳色、体型…)原样保留。
+ */
+function stripOutfitTags(baseText: string, transientText: string): string {
+  const keep = splitTagList(baseText).filter(tag => !isOutfitTag(tag));
+  const extra = splitTagList(transientText).filter(tag => !keep.some(item => item.toLowerCase() === tag.toLowerCase()));
+  return [...keep, ...extra].join(', ');
 }
 
 /**

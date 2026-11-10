@@ -9,7 +9,13 @@ import {
   type TransientPromptEntry,
   type TransientPromptState,
 } from '@/autoTag/characterPrompts';
-import { composeProfilesForPresent } from '@/state/charProfiles';
+import {
+  chatProfiles,
+  composeProfilesForPresent,
+  ensureChatProfiles,
+  lastRememberedStory,
+  resolvePresentProfiles,
+} from '@/state/charProfiles';
 import { getContext } from '@/st/context';
 import {
   normalizeCharacterPromptSettings,
@@ -223,8 +229,6 @@ export function isEntryStale(entry: TransientPromptEntry, floor: number): boolea
   return isTransientStale(entry.floor, floor);
 }
 
-/* ============ 本聊天角色档案(给渠道页的可见列表) ============ */
-
 /**
  * 本聊天角色档案的可编辑视图:每行一个角色,同时给出「档案里的固定外貌」与「用户手写的追加词」。
  *
@@ -249,6 +253,9 @@ export interface CharacterPromptRow {
 }
 
 export function listCharacterPromptRows(): CharacterPromptRow[] {
+  // 先确认本聊天档案已读进内存:渠道页可能比「角色档案」页先挂载,不在这里补一次
+  // 就会读到空的 chatProfiles,于是列 0 个角色 —— 而档案页一打开又好了,像随机 bug。
+  ensureChatProfiles();
   const names: string[] = [];
   const push = (name: string | undefined | null) => {
     const key = String(name ?? '').trim();
@@ -256,14 +263,26 @@ export function listCharacterPromptRows(): CharacterPromptRow[] {
   };
   for (const name of Object.keys(basePrompt.byChar)) push(name);
   for (const entry of temporaryPrompt.entries) push(entry.name);
+  // 档案里已有、但既没手写词也没临时词的角色同样要露面:渠道页要能把它们列出来,
+  // 否则「角色层成品串」会漏掉只有档案的角色的固定外貌。
+  for (const entry of chatProfiles.entries) push(entry.name);
   return names.map(name => {
+    // 这一串已经含「固定外貌 + 用户追加词 + 此刻穿戴」三层(见 composeProfilesForPresent),
+    // 所以下面不要再单独拼 mine,否则同一句话会进 CLIP 两遍。
     const profile = composeProfilesForPresent([name]);
     const override = String(basePrompt.byChar[name] ?? '').trim();
     const entry = temporaryPrompt.entries.find(item => item.name === name);
     const transient = entry ? entry.prompt.trim() : '';
+    // 档案那段也走 composeCharacterPrompts 的常驻位:否则 byChar 为空时它会被跳过,
+    // 于是「档案里明明有一串词、进角色层却写着（空）」。这里把 profile 与手写追加词
+    // 先各自清洗,再一起塞进常驻位,由那一份唯一实现去重合并。
     const merged = composeCharacterPrompts({
       entries: [],
-      base: { enabled: basePrompt.enabled, general: '', byChar: { [name]: override } },
+      base: {
+        enabled: basePrompt.enabled,
+        general: '',
+        byChar: { [name]: [profile, override].filter(Boolean).join(', ') },
+      },
       transient: { enabled: temporaryPrompt.enabled, entries: entry ? [entry] : [] },
       present: [name],
       generalOnly: false,
@@ -347,4 +366,37 @@ export function bindCharacterPromptSync(): void {
     flushCharacterPrompts();
     hydrateCharacterPrompts();
   });
+}
+
+/* ============ 角色层成品串:唯一取词口径 ============ */
+
+/**
+ * **角色层成品串** —— 分层拼接里「角色」那一栏发出的东西,以及渠道页那张可见列表的
+ * 每一行,全都由它算出来。这里收紧成唯一入口,原因是又出现了两套口径:
+ * 渠道页列着 1 个角色、旁边预览说「0 tag」,用户没法判断哪个才是真发出去的。
+ *
+ * 口径(与「渠道」页那张列表逐字同源,`generate.ts` 出图时直接调本函数):
+ *   1. 候选 = `listCharacterPromptRows()` 的全部行 —— 含本聊天档案里已建档的角色、
+ *      用户手写追加词的角色、以及 AI 写过临时穿戴的角色;
+ *   2. 每行 effective = 档案固定外貌 + 手写追加词 + 此刻穿戴(由 composeCharacterPrompts
+ *      唯一实现去重合并);
+ *   3. 全部按行序连起来,空行跳过。
+ *
+ * 为什么不按「在场」过滤:那张表本身只列本聊天建档过的角色,少带一个人的代价
+ * (画面上直接没有她)远大于多带 —— 分层拼接会跨层去重,重复词不会翻倍。
+ * 需要严格模式时传 `onlyPresent: true`(公开接口等场景)。
+ */
+export function characterLayerText(options: { onlyPresent?: boolean } = {}): string {
+  const rows = listCharacterPromptRows().filter(row => !!row.effective.trim());
+  if (!rows.length) return '';
+  if (options.onlyPresent === true) {
+    const present = new Set(
+      resolvePresentProfiles({ story: lastRememberedStory() }).map(name => name.toLowerCase()),
+    );
+    return rows
+      .filter(row => present.has(row.name.toLowerCase()))
+      .map(row => row.effective.trim())
+      .join(', ');
+  }
+  return rows.map(row => row.effective.trim()).join(', ');
 }

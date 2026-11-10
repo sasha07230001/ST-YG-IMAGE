@@ -181,6 +181,10 @@ function planChangeOps(plan: ImagePlan): PositionedCharOp[] {
       );
     } else if (change.field === 'nl') {
       op = createCharTagSetOp(change.name, 'nl', change.value || change.nl || '', change.reason);
+    } else if (change.field === 'state') {
+      // 「这一刻的穿戴」不进楼层的固定外貌增量:那条管线是旧的重放模型,
+      // 而 state 由本聊天档案(chatMetadata)当前值接住,见 applyProfileUpdates。
+      op = null;
     } else {
       op = createCharTagSetOp(change.name, change.field, change.value, change.reason);
     }
@@ -470,6 +474,9 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
      * 冻结档案(用户锁定的)一律不收 —— 与旧 lockedNames 同一口径。
      */
     if (!slot && plan.changes.length) {
+      // changes 里的 state = 「这一刻的穿戴/身体状态」。它与 transient 是同一件事的
+      // 两种写法(transient 是给旧链路用的扁平表),这里统一并进档案的状态字段,
+      // 于是出图时角色层一定带上最新那份 —— 不需要用户手动同步任何地方。
       const updates = plan.changes
         .filter(change => !lockedNames.has(change.name))
         .map(change => ({

@@ -31,7 +31,11 @@ import { acquireNaiSlot } from '@/floor/genQueue';
 import type { GenerationMeta } from '@/generationMeta';
 import { chatProfiles, findProfile, profileEntryTag } from '@/state/charProfiles';
 import { activeComfyPreset, activeNaiEndpoint, activeOrientationLock, effectiveComfyConn, effectiveNai, settings, type BackendId } from '@/state/settings';
-import { resolveCharacterPrompts } from '@/state/characterPromptStore';
+import {
+  characterLayerText,
+  listCharacterPromptRows,
+  resolveCharacterPrompts,
+} from '@/state/characterPromptStore';
 import { appendCharacterPrompts, pickPresentNames } from '@/autoTag/characterPrompts';
 import { composeProfilesForPresent, resolvePresentProfiles } from '@/state/charProfiles';
 
@@ -272,54 +276,23 @@ export async function generateImage(
   const fixedNegative = customPreset.simple.negative ?? '';
 
   /**
-   * **本次真正在场的角色名** —— 角色层取词的白名单。
+   * **角色层成品串** —— 与「渠道」页那张可见列表逐字同源(`characterLayerText`)。
    *
-   * ComfyUI 这条链从不传 characters[](那是 NAI 4.5/V5 的结构化多角色字段),
-   * 于是 resolveCharacterPrompts 拿到的 present 恒为空数组,它只能给出「通用常驻词」。
-   * 这就是用户看到的「角色提示词没被注入」:不是拼接层坏了,是上游根本没告诉它画的是谁。
+   * 0.7 这里曾经自己算一遍:先 `resolvePresentProfiles` 判在场,再 `composeProfilesForPresent`
+   * 取词,再加档案库兜底。问题是界面那边算的是另一遍,于是出现「渠道页列着 1 个角色、
+   * 旁边预览说 0 tag」—— 用户没法判断哪个才是真发出去的。
    *
-   * 判据只用**本图自己的提示词**(AI 刚按这一瞬间写的 tag + nl + 结构化角色名):
-   *   - 名字出现在本图 tag/nl 里,或被 AI 写进 changes(说明这一楼它出场了),就算在场;
-   *   - 名字是库里另一个名字的前缀时不算(「小雪」不该把「小雪乃」的档案拖进来);
-   *   - 宁可少带也不多带:拖进没出场的人,比少一个穿搭配件更能毁掉这张图。
+   * 现在只有一个来源:那条可见列表的每一行(= 档案固定外貌 + 手写追加词 + 此刻穿戴),
+   * 连起来就是角色层。一个角色都没认出在场时不再整段消失,因为这张表本身只列
+   * 本聊天建档过的角色,少带一个人的代价远大于多带(buildPromptLayers 跨层去重)。
+   * 通用常驻词(不分角色的那格)仍然单独接在后面。
    */
-  /**
-   * 角色层的取词口径在 0.7 换代了:**本聊天角色档案**,不再走旧的「常驻/临时」两张表。
-   *
-   * 为什么改:旧表只按名字取词,而 ComfyUI 那条链从不传 characters[],于是 present
-   * 恒空 → 只能发通用常驻词 → 用户看到的「角色提示词没被注入」。新结构里
-   * 「谁在场」由关键词命中 + 本图 tag 里出现的名字决定(见 resolvePresentProfiles),
-   * 「她长什么样」由本聊天档案提供(AI 每楼按剧情就地更新)。
-   */
+  const profileText =
+    characterPrompts.enabled === false ? '' : characterLayerText();
   const presentNames =
-    characterPrompts.enabled === false
-      ? []
-      : resolvePresentProfiles({
-          candidates: [...characters.map(character => character.name), ...candidates.names],
-          prompt: [input.prompt, input.nl ?? ''].join(' '),
-        });
-  /** 本次在场的角色档案串;同时保留旧常驻/临时表里可能残留的通用词。 */
-  const profileText = presentNames.length ? composeProfilesForPresent(presentNames) : '';
-  /**
-   * 档案库兜底:在场者只存在于用户手写的档案库、本聊天还没播种时(正文没提到他,
-   * 但 NAI 的 characters[] 或 AI 的 tag 里点了名),照档案库初始外貌发一次。
-   * 本聊天档案永远优先 —— 它记的是这一场戏里她现在的样子。
-   */
-  const bookText = presentNames
-    .filter(name => {
-      const entry = chatProfiles.entries.find(item => item.name.toLowerCase() === name.toLowerCase());
-      return !entry || !profileEntryTag(entry);
-    })
-    .map(name => {
-      const book = findProfile(name);
-      return book ? profileEntryTag(book) : '';
-    })
-    .filter(text => String(text ?? '').trim())
-    .join(', ');
+    characterPrompts.enabled === false ? [] : listCharacterPromptRows().map(row => row.name);
   const presentArchive = {
-    text: [candidates.text, profileText, bookText]
-      .filter(part => String(part ?? '').trim())
-      .join(', '),
+    text: [candidates.text, profileText].filter(part => !!String(part ?? '').trim()).join(', '),
     names: presentNames,
   };
   /** 最终进提示词的角色层:在场者的常驻 + 临时词,接在剧情 tag 之后。 */

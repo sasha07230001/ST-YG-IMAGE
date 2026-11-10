@@ -44,17 +44,15 @@ const BOOK_KEY = 'baibai_image_char_profile_book';
 const BOOK_EVENT = 'st-baibai-image:char-profile-changed';
 const SCHEMA_VERSION = 1;
 
-export interface ProfileFields {
-  fandom: string;
-  sex: string;
-  hair: string;
-  eyes: string;
-  skin: string;
-  body: string;
-  extra: string;
-  /** 招牌着装:A I 更新本聊天档案时优先保留,除非正文明确给了新的固定穿着。 */
-  outfit: string;
-}
+/**
+ * 档案字段。
+ *
+ * 直接从 `CHAR_TAG_FIELDS` 派生:字段清单只在 charTags.ts 维护一份,
+ * 这里加一句 Record 就能跟上,不会出现"新槽位能填但存不下"的错位。
+ * 语义上仍分两类:不变的外貌(fandom…extra)与默认穿戴(outfit + 各槽位 + 各饰品位),
+ * 后者只是模板 —— AI 每楼改的是本聊天档案的 `state`。
+ */
+export type ProfileFields = Record<CharTagField, string>;
 
 export interface ProfileEntry {
   /** 角色正式名(与正文/档案库一致;AI 引用时用这个名字)。 */
@@ -85,16 +83,9 @@ let revision = 0;
 let listenerBound = false;
 
 export function emptyProfileFields(): ProfileFields {
-  return {
-    fandom: '',
-    sex: '',
-    hair: '',
-    eyes: '',
-    skin: '',
-    body: '',
-    extra: '',
-    outfit: '',
-  };
+  const fields = {} as ProfileFields;
+  for (const field of CHAR_TAG_FIELDS) fields[field] = '';
+  return fields;
 }
 
 /** 关键词清洗:去重、去空白、去超长项(触发词不该是一句话)。 */
@@ -288,8 +279,17 @@ export function removeProfile(name: string): boolean {
 
 const CHAT_KEY = 'yg_char_profiles';
 
+/**
+ * 状态档(穿戴 + 身体状态)在历史里记成字段名 `state`。
+ *
+ * 为什么单列一个字段而不复用 outfit:outfit 是「固定着装」,属于外貌档案;
+ * 换了件裙子、被抓破衣服、怀孕、被打伤这些是**这一刻的样子**,下一秒就可能变,
+ * 写进 outfit 会让角色永远穿着那件衣服。两者混在一个字段里,UI 也没法分栏显示。
+ */
+export type ChatProfileStateField = 'state';
+
 export interface ChatProfileChange {
-  field: CharTagField | 'new' | 'kw' | 'nl' | 'raw';
+  field: CharTagField | ChatProfileStateField | 'new' | 'kw' | 'nl' | 'raw' | 'mine';
   from: string;
   to: string;
   reason: string;
@@ -306,6 +306,23 @@ export interface ChatProfile {
   fields: ProfileFields;
   raw: string;
   nl: string;
+  /**
+   * 这一刻的穿戴与身体状态(英文 danbooru 短 tag 串)。
+   *
+   * 由 AI 每楼按正文改写:换衣服、脱下、衣物破损、湿透、受伤、怀孕、发胖、染指甲……
+   * 都属于这里。它与 `fields` 的分工是「会变」与「不变」:外貌档案只放长期特征,
+   * 这一格放此刻的样子。出图时它会随角色层一起发出,所以每次更新完立刻反映到图里。
+   */
+  state: string;
+  /**
+   * 用户随时追加的提示词(AI 永不改写)。
+   *
+   * 存在的理由:整份档案是 AI 按剧情维护的,"我想让她永远戴那条项链"这类**用户意志**
+   * 没有地方落 —— 写进 fields 会被 AI 视作可补全的字段,写进 state 下一楼就被穿戴记录顶掉。
+   * 这一格只属于用户:它排在固定外貌之后参与角色层拼接,删空即失效,
+   * 而 AI 每楼照常更新 fields 与 state,两边互不干扰。
+   */
+  mine: string;
   /** 命中的关键词(建这份档案时的依据,UI 显示与排查用)。 */
   matched: string[];
   /** 建档楼层。 */
@@ -347,6 +364,9 @@ function normalizeChatProfile(raw: unknown): ChatProfile | null {
     fields: normalizeProfileFields(row.fields),
     raw: typeof row.raw === 'string' ? row.raw.trim() : '',
     nl: typeof row.nl === 'string' ? row.nl.trim() : '',
+    // 旧档案没有 state 键:当成「还没有穿戴记录」,不是「什么都没穿」
+    state: typeof row.state === 'string' ? row.state.trim() : '',
+    mine: typeof row.mine === 'string' ? row.mine.trim() : '',
     matched: normalizeKeywords(row.matched),
     floor: typeof row.floor === 'number' && Number.isFinite(row.floor) ? Math.floor(row.floor) : 0,
     at: typeof row.at === 'number' && Number.isFinite(row.at) ? row.at : 0,
@@ -407,13 +427,46 @@ export function flushChatProfiles(): void {
   ctx.saveMetadataDebounced?.();
 }
 
+/**
+ * 从 chatMetadata 读进内存。
+ *
+ * **必须幂等到「内容没变就不动引用」**:读出来是普通对象数组,直接 `entries = next` 会
+ * 新建引用,凡是 `computed` 里读过 `chatProfiles.entries` 的组件全部重新求值;而求值过程
+ * 又会调 `ensureChatProfiles()` —— 于是变成无限重新渲染,面板一打开就卡死。
+ *
+ * 所以这里先比内容指纹(签名相同的对象字面量),只有真的变了才替换。
+ */
 export function hydrateChatProfiles(): void {
-  chatProfiles.entries = readChatStore();
+  const next = readChatStore();
+  const nextKey = JSON.stringify(next);
+  if (nextKey !== chatFingerprint) {
+    chatFingerprint = nextKey;
+    chatProfiles.entries = next;
+  }
   hydrated = true;
 }
 
+/** 上一次 hydrate 读进来的内容指纹:相同就不动数组引用,避免 computed 抖动。 */
+let chatFingerprint = '';
+
+/**
+ * 确保本聊天档案已读进内存。
+ *
+ * 这里**每次都重读**,不是只在第一次:插件启动时 chatMetadata 可能还没加载完
+ * (`hydrateWhenReady` 只等 getContext 存在,不等聊天数据),那一次读到的就是空数组。
+ * 一旦被标成 hydrated,后面所有入口都等着这块空缓存 —— 于是出现「渠道页 0 个角色,
+ * 点一下角色档案页就正常」这种看人下菜碟的假 bug。
+ *
+ * 重读的代价只是把一个几十条的对象读进内存;漏读的代价是用户看不到任何角色词。
+ */
 export function ensureChatProfiles(): void {
-  if (!hydrated) hydrateChatProfiles();
+  const ctx = getContext();
+  // 没有聊天上下文时(测试的假 ctx、或 ST 还没进聊天)重读只会把内存里的东西清掉,
+  // 那不叫「确保已就绪」。真正的空聊天由 readChatStore 返回空数组来体现。
+  if (!ctx?.chatMetadata) return;
+  // 有未落盘的改动时也要重读:此刻内存比磁盘新,重读会把刚播的种丢掉。
+  if (persistTimer) return;
+  hydrateChatProfiles();
 }
 
 export function findChatProfile(name: string): ChatProfile | undefined {
@@ -471,6 +524,8 @@ export function seedChatProfile(entry: ProfileEntry, matched: string[], floor: n
     fields: { ...entry.fields },
     raw: entry.raw,
     nl: entry.nl,
+    state: '',
+    mine: '',
     matched: normalizeKeywords(matched),
     floor,
     at: Date.now(),
@@ -545,6 +600,10 @@ export interface ChatProfilePatch {
   fields?: Partial<ProfileFields>;
   raw?: string;
   nl?: string;
+  /** 这一刻的穿戴/身体状态(用户也可以手改,改完立刻进角色层)。 */
+  state?: string;
+  /** 用户追加的提示词(AI 不写;改它不会把这份档案标记成「手动维护」)。 */
+  mine?: string;
 }
 
 export function updateChatProfile(name: string, patch: ChatProfilePatch, floor = -1, reason = '手动编辑'): boolean {
@@ -553,6 +612,7 @@ export function updateChatProfile(name: string, patch: ChatProfilePatch, floor =
   if (!profile) return false;
   const at = Date.now();
   let changed = false;
+  let touchedBeyondMine = false;
   if (patch.fields) {
     for (const field of CHAR_TAG_FIELDS) {
       const value = patch.fields[field];
@@ -562,9 +622,10 @@ export function updateChatProfile(name: string, patch: ChatProfilePatch, floor =
       profile.history.push({ field, from: profile.fields[field], to: clean, reason, floor, at });
       profile.fields[field] = clean;
       changed = true;
+      touchedBeyondMine = true;
     }
   }
-  for (const key of ['raw', 'nl'] as const) {
+  for (const key of ['raw', 'nl', 'state', 'mine'] as const) {
     const value = patch[key];
     if (typeof value !== 'string') continue;
     const clean = value.trim();
@@ -572,10 +633,13 @@ export function updateChatProfile(name: string, patch: ChatProfilePatch, floor =
     profile.history.push({ field: key, from: profile[key], to: clean, reason, floor, at });
     profile[key] = clean;
     changed = true;
+    // 只有"用户追加提示词"这一格变了,不算手写整份档案:
+    // AI 之后照常更新 fields/state,界面上也不该显示成「手动」。
+    if (key !== 'mine') touchedBeyondMine = true;
   }
   if (!changed) return false;
   profile.at = at;
-  profile.by = 'manual';
+  if (touchedBeyondMine) profile.by = 'manual';
   if (profile.history.length > HISTORY_CAP) {
     profile.history.splice(0, profile.history.length - HISTORY_CAP);
   }
@@ -590,6 +654,8 @@ export function rollbackChatProfile(name: string, record: ChatProfileChange): bo
   const patch: ChatProfilePatch = {};
   if (record.field === 'raw') patch.raw = record.from;
   else if (record.field === 'nl') patch.nl = record.from;
+  else if (record.field === 'state') patch.state = record.from;
+  else if (record.field === 'mine') patch.mine = record.from;
   else if (record.field === 'kw') return false;
   else patch.fields = { [record.field]: record.from } as Partial<ProfileFields>;
   return updateChatProfile(name, patch, -1, '手动回滚');
@@ -606,9 +672,11 @@ export function rollbackChatProfile(name: string, record: ChatProfileChange): bo
  */
 export interface ProfileUpdate {
   name: string;
-  field: CharTagField | 'new' | 'raw' | 'nl';
+  field: CharTagField | 'new' | 'raw' | 'nl' | 'state';
   value: string;
   nl: string;
+  /** 建档那一刻的穿戴/身体状态(只有 field:"new" 会带;空 = 交给这一楼的状态记录)。 */
+  state?: string;
   reason: string;
 }
 
@@ -686,6 +754,10 @@ export function applyProfileUpdates(updates: ProfileUpdate[], floor: number): Pr
         fields: seeded.fields,
         raw: value,
         nl: update.nl.trim(),
+        // 用户追加的提示词只属于用户:AI 建档时留空,并且永远不写它
+        mine: '',
+        // AI 建档时若已经在正文里写了她穿什么,一并记成这一刻的状态
+        state: String(update.state ?? '').trim(),
         matched: [],
         floor,
         at,
@@ -709,6 +781,8 @@ export function applyProfileUpdates(updates: ProfileUpdate[], floor: number): Pr
         fields: { ...(book?.fields ?? emptyProfileFields()) },
         raw: book?.raw ?? '',
         nl: book?.nl ?? '',
+        state: '',
+        mine: '',
         matched: [],
         floor,
         at,
@@ -722,7 +796,9 @@ export function applyProfileUpdates(updates: ProfileUpdate[], floor: number): Pr
         ? { raw: value }
         : update.field === 'nl'
           ? { nl: value }
-          : { fields: { [update.field]: value } as Partial<ProfileFields> };
+          : update.field === 'state'
+            ? { state: value }
+            : { fields: { [update.field]: value } as Partial<ProfileFields> };
     if (updateChatProfile(name, patch, floor, update.reason || 'AI 更新档案')) updated.push(name);
     else unchanged += 1;
   }
@@ -745,14 +821,19 @@ export function formatProfileForPrompt(entry: Pick<ChatProfile, 'name' | 'fields
  * 关键词都没命中、本聊天档案为空时,这段退化成一句说明,不占消息位。
  */
 export function buildChatProfileBlock(entries: ChatProfile[], matchedNow: string[] = []): string {
-  const list = entries.filter(entry => profileEntryTag(entry));
+  const list = entries.filter(entry => profileEntryTag(entry) || entry.mine.trim());
   if (!list.length) return '';
   const now = new Set(matchedNow.map(name => name.trim().toLowerCase()));
   const lines = list.map(entry => {
     const mark = now.has(entry.name.toLowerCase()) ? '[本次命中]' : '[本聊天已有]';
-    return `- ${entry.name}${mark}: ${profileEntryTag(entry)}`;
+    const outfit = entry.state.trim()
+      ? `｜此刻: ${entry.state.trim()}`
+      : '｜此刻: (还没有记录,按本楼正文定一次)';
+    const mine = entry.mine.trim() ? `｜用户追加(照抄,别改别删): ${entry.mine.trim()}` : '';
+    const tag = [profileEntryTag(entry), mine].filter(Boolean).join(' ');
+    return `- ${entry.name}${mark}: ${tag}${outfit}`;
   });
-  return `【本聊天角色档案】[由 AI 按正文维护;逐字照抄进 tag,不得改写固定外貌]\n${lines.join('\n')}`;
+  return `【本聊天角色档案】[由 AI 按正文维护;外貌照抄、此刻按正文改写]\n${lines.join('\n')}`;
 }
 
 /**
@@ -830,16 +911,38 @@ export function resolvePresentProfiles(options: {
 export function composeProfilesForPresent(present: string[]): string {
   ensureChatProfiles();
   const byChar: Record<string, string> = {};
+  const pinned: Record<string, string> = {};
   for (const entry of chatProfiles.entries) {
     if (!present.some(name => name.toLowerCase() === entry.name.toLowerCase())) continue;
     const tag = profileEntryTag(entry);
-    if (!tag) continue;
-    byChar[entry.name] = tag;
+    if (tag) byChar[entry.name] = tag;
+    // 用户追加词单独走 pinned 段:它不参与穿戴替换,换装不会把用户写的话顶掉。
+    const mine = entry.mine.trim();
+    if (mine) pinned[entry.name] = mine;
   }
+  // 这一刻的穿戴与身体状态作为「临时词」交给同一份实现:它排在常驻外貌之后,
+  // 并且对同一个角色会**替换**常驻段里同类的那几个词(见 composeCharacterPrompts),
+  // 于是「换上黑色蕾丝裙」不会与档案里的 white dress 同时出现在提示词里,
+  // 而发色、瞳色、体型这些没被替换的外貌词照旧保留 —— 换衣服不该把人也换掉。
+  const transient = {
+    enabled: true,
+    entries: present
+      .map(name => {
+        const entry = chatProfiles.entries.find(item => item.name.toLowerCase() === name.toLowerCase());
+        return entry && entry.state.trim()
+          ? { name: entry.name, prompt: entry.state.trim(), floor: entry.floor, at: entry.at, frozen: false }
+          : null;
+      })
+      .filter(
+        (item): item is { name: string; prompt: string; floor: number; at: number; frozen: boolean } =>
+          item !== null,
+      ),
+  };
   const result = composeCharacterPrompts({
     entries: [],
     base: { enabled: true, general: '', byChar },
-    transient: { enabled: true, entries: [] },
+    transient,
+    pinned,
     present,
   });
   return result.text;

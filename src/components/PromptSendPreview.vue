@@ -20,7 +20,7 @@ import {
   profileEntryTag,
   resolvePresentProfiles,
 } from '@/state/charProfiles';
-import { basePrompt, listCharacterPromptRows } from '@/state/characterPromptStore';
+import { basePrompt, characterLayerText } from '@/state/characterPromptStore';
 import { computed, ref } from 'vue';
 
 /**
@@ -110,24 +110,27 @@ const liveCharacterNames = computed(() =>
 );
 
 /**
- * 角色层取词:**直接读渠道页「提示词」区那份可见列表**。
+ * 角色层这一格**会不会真的发出东西**。判据与出图完全同源:
+ * `characterLayerText()` 非空 = 这一层有内容。上一版预览自己判在场,
+ * 于是出现「渠道页明明列着角色,预览却说 0 tag」——这里不再保留第二套判定。
+ */
+const liveCharacterFilled = computed(
+  () => basePrompt.enabled && !!liveCharacterTag.value.trim(),
+);
+
+/**
+ * 角色层取词:**直接问出图那一个函数** `characterLayerText()`,预览不再另算一遍在场。
  *
- * 这里的口径在 0.7 末又收紧了一次。之前是在预览里自己再算一遍在场角色 + 档案兜底,
- * 结果是「渠道页列着 1 个角色、预览说 0 tag」—— 用户看到两处说法不一致,只能来问。
- * 现在唯一的口径是 `listCharacterPromptRows()`:它就是渠道页那张表的数据源,
- * 每行的 `effective` 已经是「档案固定外貌 + 手写追加 + 此刻穿戴」合成好的串。
- * 预览只做两件事:按在场筛,然后把它们拼起来 —— 不再有第二套判定。
- *
- * 在场标记仍用 resolvePresentProfiles 判(与出图同一函数);但**只要列表里有词就带上**,
- * 因为那张表本身已经只列「这个聊天里的角色」,漏带人物的代价远大于多带一个。
+ * 这张表的每一行 `effective` 已经是「档案固定外貌 + 手写追加词 + 此刻穿戴」合成好的串,
+ * 而 `characterLayerText()` 就是 `generate.ts` 出图时调的那一个 —— 界面上看见什么,
+ * 发出去的就是什么。上一版预览自己按在场筛,于是出现「渠道页列着 1 个角色、
+ * 预览说 0 tag」两套口径,用户根本没法判断哪个是真的。
  */
 const liveCharacterTag = computed(() => {
   if (props.characterTag && String(props.characterTag).trim()) return props.characterTag;
   if (!basePrompt.enabled) return '';
-  const present = new Set(liveCharacterNames.value.map(name => name.toLowerCase()));
-  const rows = listCharacterPromptRows().filter(row => !!row.effective.trim());
-  const ordered = [...rows.filter(row => present.has(row.name.toLowerCase())), ...rows.filter(row => !present.has(row.name.toLowerCase()))];
-  return ordered.map(row => row.effective.trim()).join(', ');
+  // 直接调出图那一个函数,预览不再另算一遍「谁在场」。
+  return characterLayerText();
 });
 const layeredOn = computed(() => props.config?.layered !== false);
 /**
@@ -362,11 +365,15 @@ const negativeOutlet = computed(() =>
           <p v-if="!layer.skipped && layer.text" class="bsp-layer-text">{{ layer.text }}</p>
           <p v-else-if="!layer.skipped" class="bsp-empty">
             <template v-if="layer.id === 'character'">
-              这一层没有内容 —— 本次没认出在场角色。
-              <template v-if="liveStoryHint">
-                取词依据是最近一次编译的正文;要么正文里没提到已建档的角色,要么「角色档案」里还没有他(去加一条,填上正文里会出现的名字/称呼)。
+              这一层没有内容 —— 本聊天角色档案里还没有能进角色层的词。
+              <template v-if="!basePrompt.enabled">
+                角色层参与拼接被关掉了,打开「渠道」页「提示词」区上面的开关即可。
               </template>
-              <template v-else>还没跑过一次自动 tag,先让某一楼生成图片再回来看。</template>
+              <template v-else-if="chatProfiles.entries.length">
+                「角色档案」里已有 {{ chatProfiles.entries.length }} 个角色,但档案里的外貌词是空的:
+                去填固定外貌(或整串),这里就会立刻出现。
+              </template>
+              <template v-else>先去「角色档案」页建一条档案,填上正文里会出现的名字/称呼与外貌。</template>
             </template>
             <template v-else-if="layer.id === 'fixed'">这一层没有内容 —— 去「渠道」页的「提示词」里填固定正面。</template>
             <template v-else>这一层没有内容 —— 等本楼正文编译出画面后就有了。</template>

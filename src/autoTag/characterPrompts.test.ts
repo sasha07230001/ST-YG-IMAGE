@@ -33,7 +33,7 @@ function transient(overrides: Partial<TransientPromptState> = {}): TransientProm
 }
 
 describe('角色档案提示词:合成顺序', () => {
-  it('通用常驻 → 角色常驻 → 角色临时(有临时的那位由临时接管其常驻)', () => {
+  it('通用常驻 → 角色常驻 → 角色临时(有临时的那位只让出同类穿戴词)', () => {
     const result = composeCharacterPrompts({
       entries: [],
       base: base({ general: 'film grain', byChar: { 小雪: 'silver pendant', 阿强: 'red jacket' } }),
@@ -42,8 +42,9 @@ describe('角色档案提示词:合成顺序', () => {
       }),
       present: ['阿强', '小雪'],
     });
-    // 阿强没有临时状态 → 常驻照旧;小雪有 → 她的常驻被白裙接管
-    expect(result.text).toBe('film grain, red jacket, white dress');
+    // 阿强没有临时状态 → 常驻照旧;小雪有 → 她的常驻里只有穿戴被白裙接管,
+    // silver pendant 这类固定特征仍在(换衣服不该把人也换掉)
+    expect(result.text).toBe('film grain, red jacket, silver pendant, white dress');
   });
 
   it('临时状态顶掉同角色的常驻段,不会两串都进 CLIP', () => {

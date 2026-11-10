@@ -4,10 +4,11 @@ import { settings } from '@/state/settings';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
-import { generateCharTags } from '@/autoTag/charAnchors';
+import { convertProfileFromText } from '@/autoTag/charAnchors';
 import { readBookMemory } from '@/autoTag/bookMemory';
 import {
   CHAR_TAG_FIELDS,
+  CHAR_TAG_FIELD_HINTS,
   CHAR_TAG_FIELD_LABELS,
   buildEntryTag,
   charTagBaseNames,
@@ -78,16 +79,8 @@ const historyOpen = ref(false);
 const confirmRollbackOpen = ref(false);
 const pendingRollback = ref<{ name: string; record: CharTagChangeRecord } | null>(null);
 
-const FIELD_PLACEHOLDERS: Record<CharTagField, string> = {
-  fandom: '同人角色填: character name (copyright name), 不带转义括号; 原创留空',
-  sex: '如 1girl / 1boy',
-  hair: '如 long black hair',
-  eyes: '如 red eyes',
-  skin: '如 pale skin(可不填)',
-  body: '如 petite, small breasts',
-  extra: '如 heterochromia(可不填)',
-  outfit: '固定着装,可不填',
-};
+// 每格提示统一来自字段表,不再各写一份(新增槽位时这里会自动跟上)。
+const FIELD_PLACEHOLDERS: Record<CharTagField, string> = CHAR_TAG_FIELD_HINTS;
 
 /** 全局库名字集(响应式),用于分区与「覆盖」徽标。 */
 const globalNameSet = computed(() => new Set(globalCharTagLib.entries.map(entry => entry.name)));
@@ -288,12 +281,12 @@ async function regenerateFromBook() {
       toastr.info('柏宝书最新状态里没有该角色的外貌记录,可手动填写', 'YG 插图师');
       return;
     }
-    const [result] = await generateCharTags([{ name, desc: role.desc }]);
-    if (!result) {
+    const parsed = await convertProfileFromText(role.desc, undefined, name);
+    if (!Object.keys(parsed.fields).length) {
       toastr.warning('模型没有返回该角色的 tag,请重试或手动填写', 'YG 插图师');
       return;
     }
-    const fields = { ...emptyCharFields(), ...result.fields };
+    const fields = { ...emptyCharFields(), ...parsed.fields };
     d.fields = fields;
     d.raw = '';
     draftSource.value = 'book';
@@ -311,6 +304,7 @@ function fieldLabel(field: CharTagChangeRecord['field']): string {
   if (field === 'new') return '建档';
   if (field === 'raw') return '整串';
   if (field === 'nl') return '自然语言';
+  if (field === 'state') return '此刻状态';
   return CHAR_TAG_FIELD_LABELS[field];
 }
 

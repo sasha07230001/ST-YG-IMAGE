@@ -98,6 +98,10 @@ const HISTORY_FIELDS: ReadonlySet<string> = new Set([
   'new',
   'raw',
   'nl',
+  // 这一刻的穿戴与身体状态(换装/破损/湿透/受伤/怀孕…)。
+  // 与 transient 是同一件事的两种写法:transient 是给旧链路和「只记在场角色」用的
+  // 扁平表,changes 里的 state 则能带上理由与位置,并且跟着建档一起报。
+  'state',
 ]);
 
 interface SourceLine {
