@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import Icon from '@/components/Icon.vue';
 import {
-  LAYER_ORDER,
-  LAYER_HINTS,
+  LAYER_LABELS,
   NEGATIVE_LAYER_HINTS,
+  LAYER_HINTS,
   buildNegativeLayers,
   buildPromptLayers,
   type NegativeLayer,
@@ -13,31 +13,44 @@ import {
 } from '@/backends/promptLayers';
 import type { ComfySimpleConfig } from '@/backends/comfyTemplates';
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
+import {
+  chatProfiles,
+  lastRememberedStory,
+  listProfileBook,
+  profileEntryTag,
+  resolvePresentProfiles,
+} from '@/state/charProfiles';
+import { basePrompt, listCharacterPromptRows } from '@/state/characterPromptStore';
 import { computed, ref } from 'vue';
 
 /**
- * 发送预览:把「这次真正会送进 ComfyUI 提示词框的那一串」原样摊开给用户看。
+ * 发送预览:把「这次真正写进 ComfyUI 的那几段字」原样摊开给用户看。
  *
- * 为什么需要它:分层拼接发生在后端组装里,`composePositive` 一返回就是一个长串,
- * 用户在原界面只能改「固定正面」那一格,看不到角色层与剧情层最后落在哪、
- * 中间还有没有被去重/被预算砍掉的东西。改采样器参数时凭感觉调词,效率极低。
+ * 这一版的取舍(0.7 重写):
  *
- * 为什么这里复用 `buildPromptLayers` / `buildNegativeLayers` 而不是自己再拼一遍:
- * 预览与真实发送必须同一个口径。各写一份的话,面板上显示 40 个 tag、实际发出去 37 个,
- * 用户永远查不出为什么。
+ * 1. **按出口组织,而不是按层组织**。旧版把三段和两段排成两个长列表,用户看完仍然
+ *    不知道「哪一段真的进了 %prompt%、哪一段根本没发出去」——那正是他踩坑的地方。
+ *    现在先给两个出口卡片(%prompt% / %negative_prompt%),每个卡片里再按层摊开,
+ *    层就落在它真实去往的出口里。
+ * 2. **出口是否真的存在要标出来**。工作流里没有 %negative_prompt% 时,负面填了也不会
+ *    生效;旧版把这个说成「当前架构不支持」,误导用户去换模板。现在只陈述事实并提供
+ *    一键复制,让用户自己往工作流里补那个占位符。
+ * 3. **custom 模式不再降级**。0.7 起 custom 模式的三层也在 generate.ts 里合成后写进
+ *    %prompt%,所以预览与简易模式同一口径,不再出现「custom · 仅正文」这种谜语。
+ * 4. 拼接仍然只用 `buildPromptLayers` / `buildNegativeLayers` 一份实现 ——
+ *    预览与真实发送必须逐字一致,各写一份的话面板显示 40 个 tag、实际发 37 个,
+ *    用户永远查不出原因。
  *
- * 正面三处调用点(渠道页 / 发送预览页 / 手动编辑弹窗)传的字段各有缺省:
- *   - 渠道页:只有固定正面,剧情层用占位文案说明「出图时才有」;
- *   - 发送预览页:可自由试衣,五格全手填;
- *   - 编辑弹窗:拿当楼草稿,是最接近真实的一次。
- *
- * 负面只有两段(固定负面 + 本图排除),但它和正向一样需要摊开:
- * 用户踩过的坑是「AI 的动态负面把固定负面挤掉了」,合并成一串之后就再也查不出来。
+ * 四个调用点(渠道页 / 发送预览页 / 编辑弹窗 / NAI 面板)传的字段各有缺省:
+ *   - 渠道页:固定正面与固定负面取自当前工作流,剧情层用示例串说明;
+ *   - 发送预览页:五格全手填,可自由试;
+ *   - 编辑弹窗:拿当楼草稿,是最接近真实的一次;
+ *   - NAI 面板:不吃 %negative_prompt%,由 `negativeInWorkflow` 关掉负面卡片。
  */
 const props = defineProps<{
-  /** 拼接规则来源(分隔符 / 去重 / 预算)。给 null 用默认口径。 */
+  /** 拼接规则来源(分隔符 / 去重 / 预算 / 顺序)。给 null 用默认口径。 */
   config?: ComfySimpleConfig | null;
-  /** custom 模式没有角色位与固定正面位,预览要如实降级。 */
+  /** custom / simple 只影响文案(custom 的唯一出口是 %prompt%)。 */
   mode?: 'custom' | 'simple';
   fixed?: string;
   story?: string;
@@ -51,16 +64,72 @@ const props = defineProps<{
   negativeBuiltin?: string;
   /** AI 动态负面(本图专用)。 */
   negativeDynamic?: string;
-  /** 模板是否支持负面(Flux 系恒不支持,预览要说明「这一格不会发」)。 */
+  /**
+   * 负面会不会真的送达。false = 工作流里没有 %negative_prompt%(或 Flux 这类没有负面
+   * 输入的后端),此时照常显示负面串,但标成「不会送达」而不是假装发送成功。
+   */
   negativeSupported?: boolean;
   title?: string;
+  /**
+   * story 是写死的一句示例(渠道页内嵌的那份就是这样)。
+   * 显式标出来,比靠正则猜「这串像不像示例」可靠 ——
+   * 猜错的代价是拿示例去判在场,一个角色都认不出来。
+   */
+  storyIsExample?: boolean;
   /** 嵌在窄栏里时收紧留白。 */
   compact?: boolean;
 }>();
 
 const customMode = computed(() => props.mode === 'custom');
-const layeredOn = computed(() => props.config?.layered !== false);
 
+/**
+ * 角色层取词的兜底:调用方没给 characterTag 时,按 characters[] 里点名的角色
+ * 从**本聊天角色档案**实时取词(与 generate.ts 的 composeProfilesForPresent 同一口径)。
+ * 这样预览页/编辑弹窗不传东西也能看到真实会发出去的角色串。
+ *
+ * 判在场的正文:优先用调用方给的 `story`(编辑弹窗给的是当楼草稿,最准);
+ * 没给就用**最近一次真编译时选中的那段正文**(`lastRememberedStory`)。
+ * 渠道页只能给一行示例串,拿示例去判在场是一个人都认不出来的 ——
+ * 那正是「发送预览·角色 = 0 tag」的成因,不能靠让用户手填正文来绕过。
+ */
+/**
+ * 判在场用的正文。调用方标了 storyIsExample 或干脆没给 story 时,
+ * 落回「最近一次真编译时选中的那段正文」。
+ */
+const liveStoryHint = computed(() => {
+  const story = String(props.story ?? '').trim();
+  return props.storyIsExample || !story ? lastRememberedStory() : story;
+});
+
+const liveCharacterNames = computed(() =>
+  resolvePresentProfiles({
+    candidates: (props.characters ?? []).map(item => item.name),
+    prompt: [liveStoryHint.value, props.storyNl ?? ''].join(' '),
+    story: liveStoryHint.value,
+  }),
+);
+
+/**
+ * 角色层取词:**直接读渠道页「提示词」区那份可见列表**。
+ *
+ * 这里的口径在 0.7 末又收紧了一次。之前是在预览里自己再算一遍在场角色 + 档案兜底,
+ * 结果是「渠道页列着 1 个角色、预览说 0 tag」—— 用户看到两处说法不一致,只能来问。
+ * 现在唯一的口径是 `listCharacterPromptRows()`:它就是渠道页那张表的数据源,
+ * 每行的 `effective` 已经是「档案固定外貌 + 手写追加 + 此刻穿戴」合成好的串。
+ * 预览只做两件事:按在场筛,然后把它们拼起来 —— 不再有第二套判定。
+ *
+ * 在场标记仍用 resolvePresentProfiles 判(与出图同一函数);但**只要列表里有词就带上**,
+ * 因为那张表本身已经只列「这个聊天里的角色」,漏带人物的代价远大于多带一个。
+ */
+const liveCharacterTag = computed(() => {
+  if (props.characterTag && String(props.characterTag).trim()) return props.characterTag;
+  if (!basePrompt.enabled) return '';
+  const present = new Set(liveCharacterNames.value.map(name => name.toLowerCase()));
+  const rows = listCharacterPromptRows().filter(row => !!row.effective.trim());
+  const ordered = [...rows.filter(row => present.has(row.name.toLowerCase())), ...rows.filter(row => !present.has(row.name.toLowerCase()))];
+  return ordered.map(row => row.effective.trim()).join(', ');
+});
+const layeredOn = computed(() => props.config?.layered !== false);
 /**
  * 预览行:PromptLayer 加「这一层这次到底发不发」。
  *
@@ -76,9 +145,9 @@ interface PreviewLayer extends PromptLayer {
 const result = computed(() =>
   buildPromptLayers(
     {
-      fixed: customMode.value ? '' : props.fixed,
-      characters: customMode.value ? undefined : props.characters,
-      characterTag: customMode.value ? undefined : props.characterTag,
+      fixed: props.fixed,
+      characters: props.characters,
+      characterTag: props.characterTag || liveCharacterTag.value,
       story: props.story,
       storyNl: props.storyNl,
     },
@@ -91,36 +160,11 @@ const result = computed(() =>
 );
 
 /**
- * 展示用的层列表。分两种降级:
- *   - custom 模式:只有剧情层真的会发送,其余层标注「不发送」并压暗;
- *   - 分层关闭:角色层不发送(与 0.5.0 旧口径一致),拼接退化为固定 + 剧情。
+ * 展示用的层列表。只有一种降级:分层被关掉。
+ * 关掉后角色层整层不发送(回到 0.5.0 旧口径:固定正面 + 剧情),此时不假装它有内容。
  */
 const layers = computed<PreviewLayer[]>((): PreviewLayer[] => {
-  if (customMode.value) {
-    return LAYER_ORDER.map((id): PreviewLayer => {
-      const found = result.value.layers.find(layer => layer.id === id);
-      const base: PromptLayer =
-        found ?? { id, label: id, text: '', tagCount: 0, chars: 0, truncated: false };
-      if (id === 'story') {
-        return {
-          ...base,
-          note: base.note ?? '工作流里由 %prompt% 占位符接收,本页显示的是原样正文',
-          skipped: false,
-        };
-      }
-      return {
-        ...base,
-        text: id === 'fixed' ? String(props.fixed ?? '') : (props.characterTag ?? ''),
-        tagCount: 0,
-        chars: 0,
-        skipped: true,
-        reason: 'custom 模式没有这一层的位置',
-      };
-    });
-  }
   if (!layeredOn.value) {
-    // 分层关:固定正面 + 剧情按旧口径拼,角色层整层不发送。
-    // 这里只给 UI 看的「固定 + 剧情」两条,角色层单独补一条并标 skipped。
     const sent = buildPromptLayers(
       { fixed: props.fixed, story: props.story, storyNl: props.storyNl },
       { separator: ', ', dedupe: false, budget: 0 },
@@ -130,13 +174,13 @@ const layers = computed<PreviewLayer[]>((): PreviewLayer[] => {
       { ...fixedLayer, skipped: false },
       {
         id: 'character' as PromptLayerId,
-        label: '角色',
+        label: LAYER_LABELS.character,
         text: '',
         tagCount: 0,
         chars: 0,
         truncated: false,
         skipped: true,
-        reason: '分层已关闭,角色提示词不会发送',
+        reason: '分层已关闭,角色层不发送',
       },
       { ...storyLayer, skipped: false },
     ];
@@ -144,9 +188,8 @@ const layers = computed<PreviewLayer[]>((): PreviewLayer[] => {
   return result.value.layers.map((layer): PreviewLayer => ({ ...layer, skipped: false }));
 });
 
-/** 实际成品串:custom 模式就是剧情原文,否则走分层拼接。 */
+/** 实际成品串:三层合成后的那一串,原样写进 %prompt% / CLIP 文本节点。 */
 const finalText = computed(() => {
-  if (customMode.value) return String(props.story ?? '').trim();
   if (!layeredOn.value) {
     return [props.fixed, (props.storyNl ?? '').trim() || props.story]
       .map(part => String(part ?? '').trim())
@@ -156,10 +199,19 @@ const finalText = computed(() => {
   return result.value.text;
 });
 
+const finalChars = computed(() => finalText.value.length);
+/** tag 数:分层关闭时结果里没有层信息,退回按成品串数逗号。 */
+const finalTags = computed(() => {
+  if (layeredOn.value) return result.value.tagCount;
+  const text = finalText.value;
+  if (!text.trim()) return 0;
+  return text.split(',').filter(part => part.trim()).length;
+});
+
 /* ---------- 负面 ---------- */
 
 /**
- * 负面取分层口径的前提:拿到了固定负面这一格。
+ * 负面取分层口径的前提:拿到了固定负面或动态负面这一格。
  * 只给 `negative`(已拼好的成品串)时不分层 —— 拼接信息已经丢了,硬拆只能靠猜。
  */
 const negativeLayered = computed(
@@ -181,52 +233,59 @@ const negativeResult = computed(() =>
   ),
 );
 
-/**
- * 负面展示行。两种降级:
- *   - custom 模式:负面由工作流里的 %negative_prompt% 自己取,这两段都没有位置,只显示固定负面;
- *   - 模板不支持负面(Flux):两段都标 skipped。
- */
 interface PreviewNegLayer extends NegativeLayer {
   skipped: boolean;
   reason?: string;
 }
 
+/**
+ * 负面展示行。只有一种降级:这一次根本送不到工作流。
+ * 这时候仍然把串显示出来,因为用户要的往往是「那我手动贴进去」。
+ */
 const negativeLayers = computed<PreviewNegLayer[]>((): PreviewNegLayer[] => {
   if (props.negativeSupported === false) {
     return negativeResult.value.layers.map((layer): PreviewNegLayer => ({
       ...layer,
       skipped: true,
-      reason: '当前架构不支持负面输入',
+      reason: '工作流里没有 %negative_prompt%',
     }));
-  }
-  if (customMode.value) {
-    return negativeResult.value.layers.map((layer): PreviewNegLayer =>
-      layer.id === 'builtin'
-        ? { ...layer, skipped: false }
-        : { ...layer, skipped: true, reason: 'custom 模式的动态负面走 %negative_prompt%' },
-    );
   }
   return negativeResult.value.layers.map((layer): PreviewNegLayer => ({ ...layer, skipped: false }));
 });
 
-/**
- * 负面成品串。
- *   - 分层口径:走 buildNegativeLayers;
- *   - 只给了成品串:原样显示(它就是 composeNegative 的输出);
- *   - 什么也没给:空。
- */
 const negativeText = computed(() => {
-  if (negativeLayered.value) {
-    if (props.negativeSupported === false) return '';
-    return negativeResult.value.text;
-  }
+  if (negativeLayered.value) return negativeResult.value.text;
   return String(props.negative ?? '').trim();
 });
 
 const negativeChars = computed(() => negativeText.value.length);
-const negativeTags = computed(() =>
-  negativeLayered.value ? String(negativeResult.value.tagCount) : '—',
-);
+const negativeTags = computed(() => {
+  if (negativeLayered.value) return negativeResult.value.tagCount;
+  const text = negativeText.value;
+  if (!text.trim()) return 0;
+  return text.split(',').filter(part => part.trim()).length;
+});
+
+/** 负面这一次到底会不会被送达。 */
+const negativeDelivered = computed(() => props.negativeSupported !== false);
+
+/* ---------- 复制 ---------- */
+
+const copied = ref(false);
+let copyTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function copyFinal() {
+  if (!finalText.value) return;
+  try {
+    await navigator.clipboard.writeText(finalText.value);
+    copied.value = true;
+    if (copyTimer) clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => (copied.value = false), 1200);
+  } catch {
+    // 剪贴板被拒(非 https / 用户拒绝授权)时不静默:文本本来就是可选的
+    copied.value = false;
+  }
+}
 
 const negativeCopied = ref(false);
 let negCopyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -243,25 +302,6 @@ async function copyNegative() {
   }
 }
 
-const finalChars = computed(() => finalText.value.length);
-const finalTags = computed(() => (customMode.value ? '—' : String(result.value.tagCount)));
-
-const copied = ref(false);
-let copyTimer: ReturnType<typeof setTimeout> | null = null;
-
-async function copyFinal() {
-  if (!finalText.value) return;
-  try {
-    await navigator.clipboard.writeText(finalText.value);
-    copied.value = true;
-    if (copyTimer) clearTimeout(copyTimer);
-    copyTimer = setTimeout(() => (copied.value = false), 1200);
-  } catch {
-    // 剪贴板被拒(非 https / 用户拒绝授权)时不静默:选中文本让用户自己复制
-    copied.value = false;
-  }
-}
-
 function hintOf(id: PromptLayerId): string {
   return LAYER_HINTS[id] ?? '';
 }
@@ -269,6 +309,12 @@ function hintOf(id: PromptLayerId): string {
 function negHintOf(id: NegativeLayerId): string {
   return NEGATIVE_LAYER_HINTS[id] ?? '';
 }
+
+/** 出口名:custom 模式唯一入口是 %prompt%,简易模式写的是 CLIP 文本节点。 */
+const positiveOutlet = computed(() => (customMode.value ? '%prompt%' : 'CLIP 正向文本'));
+const negativeOutlet = computed(() =>
+  customMode.value ? '%negative_prompt%' : 'CLIP 负向文本',
+);
 </script>
 
 <template>
@@ -279,72 +325,95 @@ function negHintOf(id: NegativeLayerId): string {
         {{ title ?? '发送预览' }}
       </span>
       <span class="bsp-meta">
-        {{ customMode ? 'custom 模式 · 仅正文' : `分层 ${layers.filter(l => !l.skipped).length}/3` }}
+        {{ layeredOn ? `分层 ${layers.filter(l => !l.skipped).length}/3` : '未分层' }}
         <em>·</em>
-        {{ finalTags }} tag
+        去重 {{ result.droppedDuplicates }}
         <em>·</em>
-        {{ finalChars }} 字
+        砍 {{ result.droppedByBudget }}
       </span>
     </div>
 
-    <ol class="bsp-layers">
-      <li
-        v-for="(layer, index) in layers"
-        :key="layer.id"
-        class="bsp-layer"
-        :class="{ 'is-skipped': layer.skipped }"
-      >
-        <div class="bsp-layer-head">
-          <span class="bsp-order">{{ layer.skipped ? '—' : index + 1 }}</span>
-          <span class="bsp-layer-name" :title="hintOf(layer.id)">{{ layer.label }}</span>
-          <span v-if="layer.skipped" class="bsp-tag-count bsp-muted">{{ layer.reason }}</span>
-          <span v-else class="bsp-tag-count">{{ layer.tagCount }} tag</span>
-        </div>
-        <p v-if="!layer.skipped && layer.text" class="bsp-layer-text">{{ layer.text }}</p>
-        <p v-else-if="!layer.skipped" class="bsp-empty">这一层没有内容</p>
-        <p v-if="layer.note" class="bsp-layer-note">{{ layer.note }}</p>
-      </li>
-    </ol>
-
-    <p v-if="result.droppedDuplicates > 0 || result.droppedByBudget > 0" class="bsp-notice">
-      <template v-if="result.droppedDuplicates > 0">
-        跨层去重删掉 {{ result.droppedDuplicates }} 个重复 tag(保先出现的层)
-      </template>
-      <template v-if="result.droppedByBudget > 0">
-        <span v-if="result.droppedDuplicates > 0"> · </span>
-        超出 tag 预算砍掉 {{ result.droppedByBudget }} 个(从末层末尾砍)
-      </template>
-    </p>
-    <p v-if="result.duplicateCharacters.length" class="bsp-notice">
-      同名角色只保留第一份:{{ result.duplicateCharacters.join('、') }}
-    </p>
-
-    <div class="bsp-final">
-      <div class="bsp-final-head">
-        <span>最终正面提示词</span>
+    <!-- 出口一:正向 -->
+    <div class="bsp-outlet">
+      <div class="bsp-outlet-head">
+        <span class="bsp-outlet-name">
+          <code>{{ positiveOutlet }}</code>
+          <em>正向 · {{ finalTags }} tag · {{ finalChars }} 字</em>
+        </span>
         <button type="button" class="bsp-copy" :disabled="!finalText" @click="copyFinal">
           <Icon name="copy" :size="12" />
           {{ copied ? '已复制' : '复制' }}
         </button>
       </div>
-      <pre class="bsp-final-text">{{ finalText || '(空)' }}</pre>
+
+      <ol class="bsp-layers">
+        <li
+          v-for="(layer, index) in layers"
+          :key="layer.id"
+          class="bsp-layer"
+          :class="{ 'is-skipped': layer.skipped }"
+        >
+          <div class="bsp-layer-head">
+            <span class="bsp-order">{{ layer.skipped ? '—' : index + 1 }}</span>
+            <span class="bsp-layer-name" :title="hintOf(layer.id)">{{ layer.label }}</span>
+            <span v-if="layer.skipped" class="bsp-tag-count bsp-muted">{{ layer.reason }}</span>
+            <span v-else class="bsp-tag-count">{{ layer.tagCount }} tag</span>
+          </div>
+          <p v-if="!layer.skipped && layer.text" class="bsp-layer-text">{{ layer.text }}</p>
+          <p v-else-if="!layer.skipped" class="bsp-empty">
+            <template v-if="layer.id === 'character'">
+              这一层没有内容 —— 本次没认出在场角色。
+              <template v-if="liveStoryHint">
+                取词依据是最近一次编译的正文;要么正文里没提到已建档的角色,要么「角色档案」里还没有他(去加一条,填上正文里会出现的名字/称呼)。
+              </template>
+              <template v-else>还没跑过一次自动 tag,先让某一楼生成图片再回来看。</template>
+            </template>
+            <template v-else-if="layer.id === 'fixed'">这一层没有内容 —— 去「渠道」页的「提示词」里填固定正面。</template>
+            <template v-else>这一层没有内容 —— 等本楼正文编译出画面后就有了。</template>
+          </p>
+          <p v-if="layer.note" class="bsp-layer-note">{{ layer.note }}</p>
+        </li>
+      </ol>
+
+      <p v-if="result.droppedDuplicates > 0 || result.droppedByBudget > 0" class="bsp-notice">
+        <template v-if="result.droppedDuplicates > 0">
+          跨层去重删掉 {{ result.droppedDuplicates }} 个重复 tag(保先出现的层)
+        </template>
+        <template v-if="result.droppedByBudget > 0">
+          <span v-if="result.droppedDuplicates > 0"> · </span>
+          超出 tag 预算砍掉 {{ result.droppedByBudget }} 个(从末层末尾砍)
+        </template>
+      </p>
+      <p v-if="result.duplicateCharacters.length" class="bsp-notice">
+        同名角色只保留第一份:{{ result.duplicateCharacters.join('、') }}
+      </p>
+
+      <pre class="bsp-final-text">{{ finalText || '(空 —— 三层都没有内容,这一次只会发出一个空提示词)' }}</pre>
     </div>
 
-    <!--
-      负面。和正向一样摊成两段:固定负面是用户定的基线,本图排除是 AI 每张都换的词。
-      合在一起显示就看不出「动态词有没有把固定负面挤掉」,而那正是这一块存在的理由。
-    -->
-    <div class="bsp-final is-negative">
-      <div class="bsp-final-head">
-        <span>
-          负面提示词
-          <em class="bsp-neg-meta">{{ negativeTags }} tag · {{ negativeChars }} 字</em>
+    <!-- 出口二:负面 -->
+    <div class="bsp-outlet is-negative">
+      <div class="bsp-outlet-head">
+        <span class="bsp-outlet-name">
+          <code>{{ negativeOutlet }}</code>
+          <em>
+            负面 · {{ negativeTags }} tag · {{ negativeChars }} 字
+            <span v-if="!negativeDelivered" class="bsp-warn">· 不会送达</span>
+          </em>
         </span>
         <button type="button" class="bsp-copy" :disabled="!negativeText" @click="copyNegative">
           <Icon name="copy" :size="12" />
           {{ negativeCopied ? '已复制' : '复制' }}
         </button>
       </div>
+
+      <p v-if="!negativeDelivered" class="bsp-notice bsp-notice-warn">
+        当前工作流没有 <code>%negative_prompt%</code> 占位符,这一格填了也不会进了。
+        想让负面生效:在工作流的负向 CLIPTextEncode 的 text 里写 <code>%negative_prompt%</code>。
+      </p>
+      <p v-else-if="!negativeLayered" class="bsp-notice">
+        这次没拿到固定负面与动态负面两格,按已拼好的成品串原样显示。
+      </p>
 
       <ol v-if="negativeLayered" class="bsp-layers bsp-layers-neg">
         <li
@@ -365,20 +434,11 @@ function negHintOf(id: NegativeLayerId): string {
         </li>
       </ol>
 
-      <p
-        v-if="
-          negativeLayered &&
-          negativeResult.droppedDuplicates > 0
-        "
-        class="bsp-notice"
-      >
+      <p v-if="negativeLayered && negativeResult.droppedDuplicates > 0" class="bsp-notice">
         动态词里有 {{ negativeResult.droppedDuplicates }} 个与固定负面的重复,已吸收(重复不改变采样结果,只白吃额度)
       </p>
-      <p v-if="negativeSupported === false" class="bsp-notice bsp-notice-warn">
-        当前架构(Flux 系)没有真实负面输入,这一格填了也不会进工作流。
-      </p>
 
-      <pre class="bsp-final-text">{{ negativeText || '(空——只有固定负面时才留空是正常的)' }}</pre>
+      <pre class="bsp-final-text">{{ negativeText || '(空 —— 这一张没有任何负面词)' }}</pre>
     </div>
   </div>
 </template>
@@ -387,7 +447,7 @@ function negHintOf(id: NegativeLayerId): string {
 .bbi-send-preview {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   padding: 10px 12px;
   border: 1px solid var(--bbi-line-strong);
   border-radius: var(--bbi-radius-sm);
@@ -395,7 +455,7 @@ function negHintOf(id: NegativeLayerId): string {
 }
 .bbi-send-preview.is-compact {
   padding: 8px 10px;
-  gap: 6px;
+  gap: 8px;
 }
 .bsp-head {
   display: flex;
@@ -421,6 +481,46 @@ function negHintOf(id: NegativeLayerId): string {
   font-style: normal;
   opacity: 0.5;
 }
+.bsp-outlet {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface);
+}
+.bsp-outlet.is-negative {
+  background: color-mix(in srgb, var(--bbi-surface) 88%, var(--bbi-line-strong));
+}
+.bsp-outlet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bsp-outlet-name {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.bsp-outlet-name code {
+  padding: 0 4px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--bbi-ink);
+  background: var(--bbi-surface-2);
+}
+.bsp-outlet-name em {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--bbi-ink-soft);
+}
+.bsp-warn {
+  color: var(--bbi-warn, #b8860b);
+}
 .bsp-layers {
   display: flex;
   flex-direction: column;
@@ -433,7 +533,7 @@ function negHintOf(id: NegativeLayerId): string {
   padding: 6px 8px;
   border: 1px solid var(--bbi-line);
   border-radius: var(--bbi-radius-sm);
-  background: var(--bbi-surface);
+  background: var(--bbi-surface-2);
 }
 .bsp-layer.is-skipped {
   opacity: 0.55;
@@ -498,36 +598,18 @@ function negHintOf(id: NegativeLayerId): string {
   font-size: 10.5px;
   color: var(--bbi-ink-soft);
 }
-.bsp-final {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding-top: 6px;
-  border-top: 1px dashed var(--bbi-line);
-}
-.bsp-final.is-negative {
-  padding-top: 4px;
-}
-.bsp-neg-meta {
-  margin-left: 6px;
-  font-style: normal;
-  font-weight: 400;
+.bsp-notice code {
+  padding: 0 3px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10.5px;
-  color: var(--bbi-ink-soft);
-}
-.bsp-layers-neg .bsp-order-neg {
-  background: var(--bbi-ink-soft);
+  background: var(--bbi-surface-2);
 }
 .bsp-notice-warn {
   color: var(--bbi-warn, #b8860b);
 }
-.bsp-final-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--bbi-ink-soft);
+.bsp-layers-neg .bsp-order-neg {
+  background: var(--bbi-ink-soft);
 }
 .bsp-copy {
   display: inline-flex;
@@ -553,10 +635,13 @@ function negHintOf(id: NegativeLayerId): string {
   margin: 0;
   max-height: 132px;
   overflow: auto;
+  padding: 6px 8px;
+  border-radius: 4px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   line-height: 1.55;
   color: var(--bbi-ink);
+  background: var(--bbi-surface-2);
   word-break: break-word;
   white-space: pre-wrap;
   user-select: text;

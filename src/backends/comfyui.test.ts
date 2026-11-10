@@ -7,6 +7,7 @@ import {
   parseWorkflowTemplate,
   randomSeed,
   renderWorkflowTemplate,
+  fillNullInputs,
   type ComfyWorkflow,
 } from '@/backends/comfyui';
 
@@ -364,5 +365,42 @@ describe('generateComfyImage 简易模式', () => {
     await expect(generateComfyImage(conn, { prompt: '1girl' })).rejects.toThrow(ComfyUIError);
     await expect(generateComfyImage(conn, { prompt: '1girl' })).rejects.toThrow('模型');
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('API 导出把 widget 值写成 null 时自动补齐', () => {
+  const flow: ComfyWorkflow = {
+    '12': { class_type: 'EmptyFlux2LatentImage', inputs: { width: null, height: null, batch_size: 1 } },
+    '13': { class_type: 'KSampler', inputs: { seed: null, steps: 16 } },
+    '20': { class_type: 'PrimitiveStringMultiline', inputs: { value: '%prompt%' } },
+  } as unknown as ComfyWorkflow;
+
+  /** ComfyWorkflow 的 inputs 是 JsonValue，测试里按需收窄。 */
+  const inputsOf = (flow_: ComfyWorkflow, id: string): Record<string, unknown> =>
+    (flow_[id] as unknown as { inputs: Record<string, unknown> }).inputs;
+
+  it('按方向补上 width/height,并按种子补上 seed', () => {
+    const filled = fillNullInputs(flow, { width: 832, height: 1216 }, 4242);
+    expect(inputsOf(filled, '12')).toMatchObject({ width: 832, height: 1216, batch_size: 1 });
+    expect(inputsOf(filled, '13')).toMatchObject({ seed: 4242, steps: 16 });
+  });
+
+  it('没有可用尺寸时不动,留给 ComfyUI 报错而不是塞假值', () => {
+    const filled = fillNullInputs(flow, null, 1);
+    expect(inputsOf(filled, '12').width).toBeNull();
+    expect(inputsOf(filled, '12').height).toBeNull();
+  });
+
+  it('custom 工作流里 %prompt% 之外全是 null 时也能渲染出可提交的 JSON', () => {
+    const template = JSON.stringify(flow);
+    const rendered = renderWorkflowTemplate(template, { prompt: '1girl, silver hair', seed: 7, width: 832, height: 1216 });
+    expect(inputsOf(rendered, '20').value).toBe('1girl, silver hair');
+    expect(inputsOf(rendered, '13').seed).toBe(7);
+    expect(inputsOf(rendered, '12').width).toBe(832);
+  });
+
+  it('不改动原工作流对象', () => {
+    fillNullInputs(flow, { width: 1, height: 1 }, 1);
+    expect(inputsOf(flow, '12').width).toBeNull();
   });
 });

@@ -11,6 +11,8 @@ import {
   composeNegativeLayersOf,
   composePositive,
   composePositiveLayers,
+  composeCustomPositive,
+  customLayerOptions,
 } from '@/backends/comfyTemplates';
 
 /**
@@ -265,5 +267,72 @@ describe('composeNegative 的分层口径', () => {
     );
     expect(negativeNode).toBeDefined();
     expect(negativeNode?.inputs.text).toBe('worst quality, bad anatomy, extra people');
+  });
+});
+
+/**
+ * 自定义工作流(custom 模式)只有 `%prompt%` 一个入口,三层必须在这里先合成一串。
+ *
+ * 这是 0.7 修掉的那个真 bug:此前 custom 模式下固定正面与角色提示词被整段丢掉,
+ * 用户以为「角色库失效」,其实是 generate.ts 走了 `comfyLayered = false` 那条老路。
+ */
+describe('custom 模式:%prompt% 三层合成', () => {
+  it('按 固定正面 → 角色 → 剧情 的顺序拼成一串', () => {
+    const text = composeCustomPositive(
+      V({
+        fixed: 'masterpiece, best quality',
+        characterTag: 'silver hair, red eyes',
+        prompt: '1girl, standing in the rain',
+      }),
+      true,
+    );
+    expect(text).toBe('masterpiece, best quality, silver hair, red eyes, 1girl, standing in the rain');
+  });
+
+  it('关掉分层退化成 固定正面 + 角色 + 剧情(角色仍在,不再整段消失)', () => {
+    const text = composeCustomPositive(
+      V({ fixed: 'masterpiece', characterTag: 'silver hair', prompt: '1girl' }),
+      false,
+    );
+    expect(text).toBe('masterpiece, silver hair, 1girl');
+  });
+
+  it('固定正面留空时不产出前导分隔符', () => {
+    const text = composeCustomPositive(V({ fixed: '   ', characterTag: 'silver hair', prompt: '1girl' }), true);
+    expect(text).toBe('silver hair, 1girl');
+  });
+
+  it('自然语言模式:层选项声明 preferNaturalLanguage 时剧情层取 nl,否则仍发 tag 串', () => {
+    const values = V({
+      fixed: 'masterpiece',
+      characterTag: 'silver hair',
+      prompt: '1girl, rain',
+      nl: 'a girl stands in the rain',
+      layerOptions: { ...customLayerOptions(true), preferNaturalLanguage: true },
+    });
+    const nlText = composeCustomPositive(values, true);
+    expect(nlText).toContain('a girl stands in the rain');
+    expect(nlText).not.toContain('1girl, rain');
+    // 默认口径(customLayerOptions)不偏自然语言:custom 模式沿用 simple.positive 的书写风格
+    expect(
+      composeCustomPositive(
+        V({ fixed: 'masterpiece', characterTag: 'silver hair', prompt: '1girl, rain', nl: 'a girl stands in the rain' }),
+        true,
+      ),
+    ).toBe('masterpiece, silver hair, 1girl, rain');
+  });
+
+  it('跨层去重:固定正面写过的词不会在角色层再发一遍', () => {
+    const text = composeCustomPositive(
+      V({ fixed: 'silver hair, masterpiece', characterTag: 'silver hair, red eyes', prompt: '1girl' }),
+      true,
+    );
+    expect(text).toBe('silver hair, masterpiece, red eyes, 1girl');
+  });
+
+  it('custom 模式不吃 simple.tagBudget:没有那份配置就不该有预算上限', () => {
+    expect(customLayerOptions(true).budget).toBe(0);
+    expect(customLayerOptions(true).order).toEqual(['fixed', 'character', 'story']);
+    expect(customLayerOptions(false).dedupe).toBe(true);
   });
 });

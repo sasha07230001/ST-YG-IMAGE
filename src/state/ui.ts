@@ -74,7 +74,10 @@ const PAGE_STORAGE_KEY = 'bbi.ui.page.v1';
 
 function loadActivePage(): string {
   try {
-    return localStorage.getItem(PAGE_STORAGE_KEY) || 'backend';
+    const saved = localStorage.getItem(PAGE_STORAGE_KEY) || 'backend';
+    // 0.7 起「发送预览」不再是独立页(它挪进了「渠道」页的提示词区),
+    // 旧版本存下的这一页名会让 App 找不到组件,这里统一回落到「渠道」。
+    return saved === 'preview' ? 'backend' : saved;
   } catch {
     return 'backend';
   }

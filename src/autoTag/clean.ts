@@ -106,6 +106,14 @@ interface SourceLineRange {
   end: number;
 }
 
+/** 正文选取/排除标签:只影响「这一轮选画面的范围」,不改历史楼层文本。 */
+export interface TargetRangeOptions {
+  /** 只在这些标签包住的段落里选画面。空/未给 = 整楼都算候选。 */
+  keepTags?: string[];
+  /** 这些标签包住的段落整块剔掉(在选取之前生效)。 */
+  stripTags?: string[];
+}
+
 export interface TargetSegment {
   /** 发给模型的短位置 ID。 */
   id: string;
@@ -182,7 +190,84 @@ function retainedLineText(source: string, line: SourceLineRange, ranges: Removal
   return pieces.join(' ').replace(/[ \t]+/g, ' ').trim();
 }
 
-function targetRemovalRanges(source: string, tags: string[]): RemovalRange[] {
+/**
+ * 选取标签:只在 <tag>…</tag> 里选画面。空名单返回 null(= 不限,调用方按整楼处理)。
+ *
+ * 与 blockStripRegexes 的区别:那里连标签一起删,这里只取**内部内容**的位置 ——
+ * 标签名本身不进正文,不然模型会以为「snow」这个词也该进 tag。
+ */
+/** 开标签:`<tag` 后须紧跟空白/斜杠/右尖括号(中文标签名也能正常匹配)。 */
+const ATTR_TAIL = "\\s*/?\\s*\\u003e";
+function openTagPattern(tag: string): string {
+  return "\\u003c" + tag + "(?=[\\s/\\u003e])[^\\u003e]*" + ATTR_TAIL;
+}
+function closeTagPattern(tag: string): string {
+  return "\\u003c/" + tag + "\\s*\\u003e";
+}
+
+function innerRangeRegexes(tag: string): RegExp[] {
+  return [
+    new RegExp(`<${tag}(?=[\\s/>])[^>]*>([\\s\\S]*?)</${tag}>`, 'gi'),
+    new RegExp(`<${tag}(?=[\\s/>])[^>]*/>`, 'gi'), // 自闭标签:空内容也算一段,免得整楼被裁空
+  ];
+}
+
+function targetSelectionRanges(source: string, tags: string[]): RemovalRange[] | null {
+  const clean = tags.filter(Boolean);
+  if (!clean.length) return null;
+  const ranges: RemovalRange[] = [];
+  for (const tag of clean) {
+    for (const regex of innerRangeRegexes(tag)) {
+      for (const match of source.matchAll(regex)) {
+        if (match.index === undefined) continue;
+        if (match[1] === undefined) {
+          // 自闭标签 <x />:把整个标签位置当作一段(空内容会在后面被丢掉)
+          ranges.push({ start: match.index, end: match.index + match[0].length });
+          continue;
+        }
+        const innerStart = match.index + match[0].indexOf(match[1]);
+        ranges.push({ start: innerStart, end: innerStart + match[1].length });
+      }
+    }
+  }
+  if (!ranges.length) return [];
+  return mergeRanges(ranges);
+}
+
+/** 排除标签:这些段整块不进候选(先于选取生效,免得选取段里的排除段又被捞回来)。 */
+function targetExcludeRanges(source: string, tags: string[]): RemovalRange[] {
+  const ranges: RemovalRange[] = [];
+  for (const tag of tags.filter(Boolean)) {
+    for (const regex of blockStripRegexes(tag)) ranges.push(...rangesForRegex(source, regex));
+  }
+  return ranges;
+}
+
+/**
+ * 限定了选取范围时,把范围外的非空物理行整行标记为删除。
+ * 逐行判断而不是按行号裁剪:一段正文可能跨行,行内也可能只有半个范围。
+ */
+function outsideSelectionRanges(source: string, keep: RemovalRange[]): RemovalRange[] {
+  const keepSorted = mergeRanges(keep);
+  const out: RemovalRange[] = [];
+  for (const line of sourceLineRanges(source)) {
+    if (line.end <= line.start) continue;
+    if (!source.slice(line.start, line.end).trim()) continue;
+    // 同一行里既有范围外文字又有范围内文字(中文正文经常一段一行):
+    // 只要这一行与任一选取范围有交集就保留 —— 反过来按「整行被包住」判会把
+    // <场面>她笑了。</场面>外头的雨没停。 这种写法整行丢掉。
+    const covered = keepSorted.some(range => range.start < line.end && range.end > line.start);
+    if (covered) continue;
+    out.push({ start: line.start, end: line.end });
+  }
+  return out;
+}
+
+function targetRemovalRanges(
+  source: string,
+  tags: string[],
+  options: TargetRangeOptions = {},
+): RemovalRange[] {
   const noise: RemovalRange[] = [
     ...rangesForRegex(source, RE_THINK_BLOCK),
     ...rangesForRegex(source, /<!--[\s\S]+?-->/g),
@@ -191,6 +276,31 @@ function targetRemovalRanges(source: string, tags: string[]): RemovalRange[] {
   for (const tag of [...tags, 'bbs_items', 'bbs_vars']) {
     if (!tag) continue;
     for (const regex of blockStripRegexes(tag)) noise.push(...rangesForRegex(source, regex));
+  }
+
+  // 排除标签:与噪声同一处理(整块删),但**先于**选取范围计算,
+  // 否则「排除段落在选取段里」时会被选取范围又捞回来。
+  noise.push(...targetExcludeRanges(source, options.stripTags ?? []));
+
+  const keep = targetSelectionRanges(source, options.keepTags ?? []);
+
+  // 选取标签的标签壳不该留在正文里(模型会把 <正文> 当成叙事的一部分)。
+  // 只删壳、保留内容:用内部区间把整块匹配切成「左壳 + 内文 + 右壳」。
+  for (const tag of (options.keepTags ?? []).filter(Boolean)) {
+    const pairRe = new RegExp(openTagPattern(tag) + "([\\s\\S]*?)" + closeTagPattern(tag), "gi");
+    for (const match of source.matchAll(pairRe)) {
+      const shellStart = match.index ?? 0;
+      const shellEnd = shellStart + match[0].length;
+      const inner = match[1] ?? "";
+      const innerStart = shellStart + match[0].indexOf(inner);
+      noise.push({ start: shellStart, end: innerStart });
+      noise.push({ start: innerStart + inner.length, end: shellEnd });
+    }
+    const selfRe = new RegExp(openTagPattern(tag).replace(ATTR_TAIL, "\\/>"), "gi");
+    for (const match of source.matchAll(selfRe)) {
+      const at = match.index ?? 0;
+      noise.push({ start: at, end: at + match[0].length });
+    }
   }
 
   const masked = maskedSource(source, noise);
@@ -219,16 +329,24 @@ function targetRemovalRanges(source: string, tags: string[]): RemovalRange[] {
       })));
     }
   }
-  return mergeRanges([...noise, ...crop, ...timeTags]);
+  const merged = mergeRanges([...noise, ...crop, ...timeTags]);
+  if (!keep) return merged;
+  // 有选取名单:范围外的整行也当噪声删掉(keep 与 noise 不会重叠 ——
+  // 噪声段本来就被整块删,不会被选中)。
+  return mergeRanges([...merged, ...outsideSelectionRanges(source, keep)]);
 }
 
 /**
  * 目标正文删除同款噪声和时间标签，并只给保留下来的非空物理行追加段尾位置 ID。
  * 每个 ID 直接保存原始 sourceLine，不再要求模型复制原文，也不依赖清洗后文本反查。
  */
-export function prepareTargetText(mes: string, tags: string[]): PreparedTargetText {
+export function prepareTargetText(
+  mes: string,
+  tags: string[],
+  options: TargetRangeOptions = {},
+): PreparedTargetText {
   const source = String(mes ?? '');
-  const ranges = targetRemovalRanges(source, tags);
+  const ranges = targetRemovalRanges(source, tags, options);
   const segments = sourceLineRanges(source)
     .map(line => ({ sourceLine: line.index, text: retainedLineText(source, line, ranges) }))
     .filter(segment => !!segment.text)

@@ -1,5 +1,5 @@
 import { buildSimpleWorkflow } from '@/backends/comfyTemplates';
-import { parseSize, pickSize, type Orientation } from '@/backends/size';
+import { parseSize, pickSize, type Orientation, type SizePair } from '@/backends/size';
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import { getContext } from '@/st/context';
 import { type ComfyRunConn } from '@/state/settings';
@@ -19,8 +19,8 @@ export interface ComfyTemplateValues {
   /** 画幅方向;generateComfyImage 据此从渠道配置解析出 width/height。 */
   size?: Orientation;
   /**
-   * 角色层(简易模式 + 分层开启时由 composePositive 拼进正向)。
-   * custom 模式没有角色位,传进来也不会用。
+   * 角色层。简易模式下由 composePositive 拼进正向提示词;custom 模式(工作流里只有
+   * %prompt%)下,角色层已由 generate.ts 提前合成进 prompt,这两个字段只留作随图记录。
    */
   characters?: ImageCharacterPrompt[];
   /** 已合成的角色档案串(常驻 + 临时),与 characters 一起构成角色层。 */
@@ -37,6 +37,15 @@ export interface ComfyImageResult {
 
 const SUPPORTED_PLACEHOLDERS = new Set(['prompt', 'negative_prompt', 'seed', 'nl', 'width', 'height']);
 const PLACEHOLDER_PATTERN = /%([a-z][a-z0-9_]*)%/g;
+/**
+ * 工作流里那种「纯占位符字符串」的允许范围。独立于 PLACEHOLDER_PATTERN:
+ * 替换只认命中的这几种,而**原样保住**其它 %xxx%。
+ *
+ * 为什么要这么细:有些节点自己就吃 %如% 这种写法(文件名、模板、自定义宏),
+ * 只要能匹配到占位符语法就报「含暂不支持的占位符」会让一整类工作流根本贴不进来。
+ * 只有本插件真认得、能填值的那几个才允许精确替换,其余一律当普通文本。
+ */
+const EXACT_PLACEHOLDER = /^%(prompt|negative_prompt|seed|nl|width|height)%$/;
 const SERVER_BASE = '/api/sd/comfy';
 const POLL_INTERVAL_MS = 500;
 const POLL_TIMEOUT_MS = 10 * 60 * 1000;
@@ -109,9 +118,41 @@ export function getWorkflowPlaceholders(template: string): string[] {
   return [...found].sort();
 }
 
+/**
+ * 把工作流里**裸 null** 的数值输入补上。
+ *
+ * 病根在 ComfyUI 前端:「Save (API Format)」导出时,未连线的 widget 值会是 `null`
+ * 而不是默认值(node 12 的 width/height、node 13 的 seed 都是这么来的)。
+ * ComfyUI 服务端接线前会把 null 当成「用户显式给了空」,于是校验直接报
+ * `Failed to convert an input value to a INT value ... not 'NoneType'`——
+ * 报错指向节点,却不告诉你其实是导出格式带的坑。
+ *
+ * 这里按占位符语义补齐(尺寸取渠道画幅、种子随机);其余裸 null 一律按如下规则:**
+ * 能查到 type 的用该类型的零值,查不到就不动**——留 null 让 ComfyUI 报错,
+ * 总比塞一个假值让它画出错图更难排。
+ */
+export function fillNullInputs(workflow: ComfyWorkflow, size: { width: number; height: number } | null, seed: number): ComfyWorkflow {
+  const clone = JSON.parse(JSON.stringify(workflow)) as ComfyWorkflow;
+  for (const node of Object.values(clone)) {
+    const inputs = (node as { inputs?: Record<string, unknown> }).inputs;
+    if (!inputs) continue;
+    for (const [key, value] of Object.entries(inputs)) {
+      if (value !== null) continue;
+      if (key === 'width' || key === 'height') {
+        const px = size ? (key === 'width' ? size.width : size.height) : 0;
+        if (px > 0) inputs[key] = px;
+        continue;
+      }
+      if (key === 'seed' || key === 'noise_seed') {
+        inputs[key] = seed;
+      }
+    }
+  }
+  return clone;
+}
 function replacePlaceholders(value: unknown, replacements: Record<string, string | number>): unknown {
   if (typeof value === 'string') {
-    const exact = value.match(/^%([a-z][a-z0-9_]*)%$/);
+    const exact = value.match(EXACT_PLACEHOLDER);
     if (exact && Object.hasOwn(replacements, exact[1])) return replacements[exact[1]];
 
     return value.replace(PLACEHOLDER_PATTERN, (marker, name: string) =>
@@ -139,31 +180,49 @@ function replacePlaceholders(value: unknown, replacements: Record<string, string
  * 里面压根没有占位符;那条路只能粘进来就报错,体验上等于不支持自定义工作流。
  * 占位符与定位式可以共存:写了 %prompt% 的节点按占位符走,没写的节点一概不碰文字。
  */
-export function renderWorkflowTemplate(template: string, values: ComfyTemplateValues): ComfyWorkflow {
+export function renderWorkflowTemplate(
+  template: string,
+  values: ComfyTemplateValues,
+  /** 尺寸兜底用的渠道尺寸对;缺省 = 不做兜底(尺寸占位符拿不到值时照旧报错)。 */
+  conn?: SizePair,
+): ComfyWorkflow {
   const workflow = parseWorkflowTemplate(template);
   const found = new Set<string>();
   collectPlaceholders(workflow, found);
 
-  const unsupported = [...found].filter(name => !SUPPORTED_PLACEHOLDERS.has(name));
-  if (unsupported.length) throw new ComfyUIError(`工作流含暂不支持的占位符：${unsupported.map(x => `%${x}%`).join('、')}`);
+  // 不认识的占位符从**不**报错:有些节点自己就吃 %开头%结尾 的字面量(文件名模板、宏),
+  // 硬报错等于宣布「这类工作流贴不进来」。这里只做提示,替换阶段一律原样保留。
+  const unknown = [...found].filter(name => !SUPPORTED_PLACEHOLDERS.has(name));
 
   const needsSize = found.has('width') || found.has('height');
-  if (needsSize && !(values.width && values.height)) {
+  const seed = values.seed ?? randomSeed();
+  // 尺寸兜底:调用方没给(或给了 0)时按方向取渠道里配的那一对,再不行才报错。
+  // 只写一处兜底,是因为 %width%/%height% 被替换成 0 的症状在 ComfyUI 那边
+  // 「Failed to convert an input value to a INT value」——报错点在 ComfyUI,不在本插件,
+  // 用户根本看不出是自己没填尺寸。能补齐就在这里补齐并照常出图。
+  const fallbackSize = parseSize(pickSize(conn ?? { portraitSize: '', landscapeSize: '' }, values.size ?? 'portrait'));
+  const width = values.width || fallbackSize?.width || 0;
+  const height = values.height || fallbackSize?.height || 0;
+  if (needsSize && !(width && height)) {
     throw new ComfyUIError('工作流用到了 %width%/%height%，请先在 ComfyUI 渠道页填写竖屏与横屏尺寸（如 832×1216）');
   }
 
-  const seed = values.seed ?? randomSeed();
   const rendered = replacePlaceholders(workflow, {
     prompt: values.prompt,
     negative_prompt: values.negative_prompt ?? '',
     nl: values.nl ?? '',
-    width: values.width ?? 0,
-    height: values.height ?? 0,
+    width,
+    height,
     seed,
   }) as ComfyWorkflow;
 
-  if (found.has('prompt')) return rendered;
-  return applyPromptToClipNodes(rendered, values.prompt, values.negative_prompt ?? '');
+  // 裸 null 兜底。工作流没写 %width%/%height% 时才可能走到这里(needsSize 为假),
+  // 但「API 导出把 widget 值写成 null」和占位符是两回事:node 12 的 width/height、
+  // node 13 的 seed 天生就是 null,不补的话 ComfyUI 一定报 INT 转换失败。
+  const filled = fillNullInputs(rendered, width && height ? { width, height } : fallbackSize, seed);
+
+  if (found.has('prompt')) return filled;
+  return applyPromptToClipNodes(filled, values.prompt, values.negative_prompt ?? '');
 }
 
 /** 会被当成「文本编码节点」的类名(含社区常见变体)。 */
@@ -608,7 +667,7 @@ export async function generateComfyImage(
       throw new ComfyUIError(error instanceof Error ? error.message : String(error));
     }
   } else {
-    workflow = renderWorkflowTemplate(conn.workflow, { ...values, ...size });
+    workflow = renderWorkflowTemplate(conn.workflow, { ...values, ...size }, conn);
   }
 
   // 通道自动选择:浏览器直连优先;仅当请求根本没送达 ComfyUI(网络级失败)时回退 ST 后端转发。

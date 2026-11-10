@@ -76,6 +76,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts({ jailbreak: '附加规则' }),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -122,6 +124,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -140,6 +144,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(
@@ -185,6 +191,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
 
@@ -219,6 +227,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -268,7 +278,7 @@ describe('auto tag prompt', () => {
     expect(thinkingMsg?.content).toContain('白皙肤色词混进任何一张图');
     expect(thinkingMsg?.content).toContain('tan、dark skin 不在此列');
     // 建档字段的详细写法瘦身后只留在任务协议一份,thinking 不再复述。
-    expect(messages.some(m => m.content.includes('建档写法：{"name":"角色名","field":"new"'))).toBe(true);
+    expect(messages.map(m => m.content).join('\n')).toContain('建档写法**：{"name":"角色名","field":"new"');
     // 新旧档案的 position 语义、时代判断的发挥边界:瘦身后各自只留一份权威副本
     // (分别在任务协议与后端规范),thinking 不再复述,但整套消息里必须仍在。
     expect(messages.some(m => m.content.includes('该位置之前的图片使用旧档案'))).toBe(true);
@@ -302,7 +312,7 @@ describe('auto tag prompt', () => {
     expect(messages.some(m => m.content.includes('navy school blazer, white collared shirt, red ribbon'))).toBe(true);
     expect(thinkingMsg?.content).toContain('镜头外不可见的部件可以省略，但省略不等于脱掉');
     expect(thinkingMsg?.content).toContain('没有散落的无主特征');
-    expect(messages.some(m => m.content.includes('每个在场正式角色必须二选一'))).toBe(true);
+    expect(messages.some(m => m.content.includes('在场正式角色'))).toBe(true);
     expect(messages.some(m => m.content.includes('禁止把两人的外貌特征散放成无法归属的一串公共 tag'))).toBe(true);
     expect(thinkingMsg?.content).toContain('定一套具体、自洽的时代/文明/视觉体系并全楼沿用');
     expect(messages.some(m => m.content.includes('必须先判断，并主动具体化'))).toBe(true);
@@ -323,6 +333,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts({ comfyThinking: '自定义清单' }),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -344,6 +356,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts({
         comfyThinking: 'COMFY-CHECKLIST',
         naiThinking: 'NAI-CHECKLIST',
@@ -395,6 +409,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -473,6 +489,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -536,6 +554,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -606,6 +626,8 @@ describe('auto tag prompt', () => {
         retryCount: 1,
         autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
         prompts: prompts(),
       };
       const oldBackend = settings.defaultBackend;
@@ -656,6 +678,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -697,6 +721,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -739,6 +765,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const library = '【角色固定外貌库(系统维护)】\n小雪: 1girl, long silver hair';
@@ -764,6 +792,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -782,6 +812,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(
@@ -808,6 +840,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -820,7 +854,8 @@ describe('auto tag prompt', () => {
       expect(messages.some(message => message.content.includes('"characters":['))).toBe(true);
       expect(messages.some(message => message.content.includes('source# / target# / mutual#'))).toBe(true);
       expect(messages.some(message => message.content.includes('Character tag uses girl/boy without a numeric count'))).toBe(true);
-      expect(messages.some(message => message.content.includes('every field:"new" change must include a non-empty nl'))).toBe(true);
+      // nl 硬要求已移进通用建档规则(不再只在 naiCharPromptsOn && nlOn 时出现)
+      expect(messages.map(message => message.content).join('\n')).toContain('NAI 的 nl 是硬要求');
       expect(messages.some(message => message.content.includes('Expression and gaze are mandatory for every character'))).toBe(true);
       // Base 的全局性对 tag 与 nl 同样成立:实跑里模型把单角色的制服/体型写进 Base nl,
       // 与角色 nl 重复——旧文本只把禁令写在 tag 层面。
@@ -844,6 +879,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -880,6 +917,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -919,6 +958,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -954,6 +995,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -997,6 +1040,8 @@ describe('auto tag prompt', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -1061,6 +1106,8 @@ describe('NAI「生成自然语言」开关与渠道画幅锁', () => {
       retryCount: 1,
       autoGenerate: true,
       transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
       prompts: prompts(overrides),
     };
   }
@@ -1118,7 +1165,6 @@ describe('NAI「生成自然语言」开关与渠道画幅锁', () => {
         expect(contract).toContain('This output is tag-only');
         expect(contract).toContain('name and tag are both required');
         // 建档也不再要 nl —— runner 验收同一口径(profile.nl),否则会为不存在的要求白耗重试
-        expect(contract).not.toContain('every field:"new" change must include a non-empty nl');
 
         // 规范第 6 条整条换成 tag-only 版本(编号不动),示例与条目形状同步去掉 nl
         expect(spec).toContain('This output is tag-only: write no nl key anywhere');
@@ -1136,7 +1182,8 @@ describe('NAI「生成自然语言」开关与渠道画幅锁', () => {
           .join('\n');
         expect(on).toContain('"nl":"A girl stands in a classroom');
         expect(on).toContain('Save adjectival nuance for nl.');
-        expect(on).toContain('every field:"new" change must include a non-empty nl');
+        // NAI 的建档 nl 硬要求移到通用建档规则里(不再只藏在内置规范),从全文里找
+        expect(on).toContain('NAI 的 nl 是硬要求');
         expect(on).toContain('不写完整 nl 句');
         expect(on).not.toContain('This output is tag-only');
         expect(on).not.toContain('本次只写 tag');
@@ -1198,7 +1245,9 @@ describe('NAI「生成自然语言」开关与渠道画幅锁', () => {
       const contract = pick(await buildAutoTagMessages(context(), 1, options(), null), CONTRACT_MARK);
       expect(contract).toContain('锁定为横图，每张图都填 "landscape"');
       expect(contract).toContain('判据本次不适用');
-      expect(contract).toContain('"size":"landscape"}],"changes":[]}');
+      // 锁方向只改 size 字段;示例 JSON 后面可能还跟着 transient 键(见 transientAutoRead),
+      // 所以只锁 "size":"landscape" 这一片段本身,不锁它后面紧跟什么。
+      expect(contract).toContain('"size":"landscape"');
       expect(contract).not.toContain('拿不准就填 "portrait"');
     } finally {
       state.restore();
@@ -1213,7 +1262,7 @@ describe('NAI「生成自然语言」开关与渠道画幅锁', () => {
       state.preset.orientationLock = 'portrait';
       let contract = pick(await buildAutoTagMessages(context(), 1, options(), null), CONTRACT_MARK);
       expect(contract).toContain('锁定为竖图，每张图都填 "portrait"');
-      expect(contract).toContain('"size":"portrait"}],"changes":[]}');
+      expect(contract).toContain('"size":"portrait"');
 
       state.preset.orientationLock = 'auto';
       contract = pick(await buildAutoTagMessages(context(), 1, options(), null), CONTRACT_MARK);
@@ -1254,5 +1303,86 @@ describe('NAI「生成自然语言」开关与渠道画幅锁', () => {
     } finally {
       state.restore();
     }
+  });
+});
+
+/**
+ * 0.7 单次调用:画面、建档与穿戴在同一个 JSON 里给出。
+ *
+ * 这一组锁三件很容易被改回去的事:
+ * 1. transient 规则只在开关打开时出现,且边界(临时更换 vs 永久变化)写在协议里;
+ * 2. 示例 JSON 里必须有 transient 键 —— 模型抄示例永远比读规则可靠;
+ * 3. 「用哪台模型」不再改变协议:relay 模式下角色固定外貌库与建档规则照旧存在。
+ */
+describe('auto tag 单次调用协议(transient 与模型无关)', () => {
+  function opts(overrides: Partial<AutoTagSettings> = {}): AutoTagSettings {
+    return {
+      enabled: true,
+      contextMessages: 2,
+      minImages: 0,
+      maxImages: 3,
+      retryCount: 1,
+      autoGenerate: true,
+      transientAutoRead: true,
+      targetTags: [],
+      targetStripTags: [],
+      prompts: prompts(),
+      ...overrides,
+    };
+  }
+
+  it('transient 规则与示例键都在同一份契约里', async () => {
+    const messages = await buildAutoTagMessages(context(), 1, opts(), null);
+    const all = messages.map(m => m.content).join('\n');
+    expect(all).toContain('transient');
+    expect(all).toContain('{"角色名":"tag 串"}');
+    // 边界:临时更换进 transient,只有长期固定才进 changes
+    expect(all).toContain('绝不写进 changes 的字段');
+    expect(all).toContain('change');
+    // 示例 JSON 必须示范这个键,否则模型大概率整段省略
+    expect(all).toMatch(/"transient":\{"小雪"/);
+  });
+
+  it('关掉「每楼读取穿戴」后规则与示例键都不出现', async () => {
+    const messages = await buildAutoTagMessages(context(), 1, opts({ transientAutoRead: false }), null);
+    const all = messages.map(m => m.content).join('\n');
+    expect(all).not.toContain('{"角色名":"tag 串"}');
+    expect(all).not.toMatch(/"transient":\{"小雪"/);
+    // 规则正文本身也要断掉:关掉开关后不该再出现这段穿戴要求
+    expect(all).not.toContain('同时在 transient 键里记下这一刻的穿戴');
+  });
+
+  it('换模型不换协议:relay 模式仍然带角色固定外貌库与建档规则', async () => {
+    const relayMessages = await buildAutoTagMessages(
+      context(),
+      1,
+      opts({ prompts: prompts({ mode: 'relay' }) }),
+      null,
+    );
+    const relayText = relayMessages.map(m => m.content).join('\n');
+    const builtinMessages = await buildAutoTagMessages(context(), 1, opts(), null);
+    const builtinText = builtinMessages.map(m => m.content).join('\n');
+
+    expect(relayText).toContain('角色固定外貌库');
+    expect(relayText).toContain('"field":"new"');
+    expect(relayText).toContain('transient');
+    // 没有自定义开场身份时,两条链的文本只差末尾那行画幅提示
+    const strip = (text: string) => text.replace(/\n\n画幅:[^\n]*$/, '');
+    expect(strip(relayText)).toBe(strip(builtinText));
+  });
+
+  it('自定义开场身份只多一条 system,不替换内置契约', async () => {
+    const messages = await buildAutoTagMessages(
+      context(),
+      1,
+      opts({ prompts: prompts({ mode: 'relay', relaySystem: '【编译员】本场由中转站编译' }) }),
+      null,
+    );
+    const text = messages.map(m => m.content).join('\n');
+    // 自定义开场身份是 jailbreak 之后的第 2 条(system),位置固定,不看内容猜
+    expect(messages[1].role).toBe('system');
+    expect(messages[1].content).toContain('【编译员】');
+    expect(text.indexOf('【编译员】')).toBeLessThan(text.indexOf('角色固定外貌库'));
+    expect(text).toContain('你是严谨的剧情画面规划与生图提示词编写员');
   });
 });

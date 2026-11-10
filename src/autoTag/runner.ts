@@ -6,10 +6,6 @@ import {
   type PositionedCharOp,
 } from '@/autoTag/charAnchors';
 import { prepareTargetText } from '@/autoTag/clean';
-import {
-  buildTransientTaskPrompt,
-  parseTransientReply,
-} from '@/autoTag/characterPrompts';
 import { clearTransient, setTransientForChar, temporaryPrompt } from '@/state/characterPromptStore';
 import { beginGeneration, clearGeneration, consumeGeneration } from '@/autoTag/generationGate';
 import { autoTagProfile, buildAutoTagMessages } from '@/autoTag/prompt';
@@ -29,7 +25,20 @@ import {
   type CharTagAutoOp,
   type CharTagField,
 } from '@/state/charTags';
-import { injectImageTags, parseImagePlan, type ImagePlan } from '@/autoTag/protocol';
+import {
+  injectImageTags,
+  parseImagePlan,
+  type ImagePlan,
+  type TransientPromptUpdate,
+} from '@/autoTag/protocol';
+import {
+  applyProfileUpdates,
+  buildChatProfileBlock,
+  chatProfiles,
+  rememberStoryText,
+  resolvePresentProfiles,
+  seedChatProfilesFromText,
+} from '@/state/charProfiles';
 import {
   clearAutoGenerateForFloor,
   consumeAutoGenerate,
@@ -259,13 +268,21 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     abort(floor, 'empty-source', opts.manual, '本楼正文是空的（或只剩生图 tag），没有可分析的内容');
     return;
   }
-  const preparedTarget = prepareTargetText(source, settings.excludes.customStripTags);
+  // 正文选取/排除标签:只影响「这一轮拿哪几段去选画面」。
+  // 选取名单非空时只有被标签包住的段落进候选;排除名单先整块剔掉。
+  // 两份名单在设置页「自动生成 tag → 正文选取标签」里维护。
+  const preparedTarget = prepareTargetText(source, settings.excludes.customStripTags, {
+    keepTags: settings.autoTag.targetTags,
+    stripTags: settings.autoTag.targetStripTags,
+  });
   if (!preparedTarget.segments.length) {
     abort(
       floor,
       'no-target-segments',
       opts.manual,
-      '本楼正文清洗后没剩下叙事内容（可能被「剔除标签」名单或思维链/注释规则全删了），没有可分析的段落',
+      settings.autoTag.targetTags.length
+        ? `本楼正文里没有找到被 ${settings.autoTag.targetTags.map(tag => '<' + tag + '>').join('、')} 包住的段落,所以没有可选画面的范围`
+        :       '本楼正文清洗后没剩下叙事内容（可能被「剔除标签」名单或思维链/注释规则全删了），没有可分析的段落',
       { sourceLength: source.length },
     );
     return;
@@ -306,8 +323,21 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     const entriesBefore = slot ? charTagsBeforeFloor(floor + 1) : charTagsBeforeFloor(floor);
     // 锁定名(全局库 ⊖ 本聊天基线):AI 的 changes 对这些名字一律无效,库文本里带 [locked] 标记
     const lockedNames = lockedCharTagNames();
-    // 纯本地渲染:建档由主请求在同一次输出里完成(changes 的 field="new")
-    const anchors = resolveCharAnchors(entriesBefore, lockedNames);
+    /**
+     * 角色档案(0.7):先把本楼正文里命中关键词、尚未建档的角色拉进「本聊天角色档案」,
+     * 再把这份档案渲染成区块交给模型 —— 它才是这一场戏里她实际的样子。
+     *
+     * 顺序很要紧:seed 必须在读区块之前。否则第一次提到「小雪」的这栋楼,
+     * 模型手上还什么都没有,只能自己编一份(编出来的又会被下次播种覆盖)。
+     */
+    const targetStory = preparedTarget.segments.map(segment => segment.text).join(String.fromCharCode(10, 10));
+    seedChatProfilesFromText(targetStory, floor);
+    rememberStoryText(targetStory);
+  rememberStoryText(targetStory);
+  const presentNow = resolvePresentProfiles({ story: targetStory });
+    const profileBlock = buildChatProfileBlock(chatProfiles.entries, presentNow);
+    // 纯本地渲染:档案区块直接取自本聊天档案,不再让模型自己维护一份外貌库
+    const anchors = { text: profileBlock, names: presentNow };
     // 单槽重写:协议强制「恰好 1 张」,并把该槽位当前提示词与其余槽位摘要带给模型
     // (锚住同一个画面、别抢别人的画面)。min/max 要同时覆盖 build 的规则文案与下面的
     // parse 校验,只改一处会自相矛盾。
@@ -327,30 +357,12 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       profile,
     );
     const channel = getTagGenChannel();
-    // 提示词方式:内置 LLM 分析(结构化协议) 或 中转站编译(正文 → 一行 CLIP 提示词)。
-    // 两者的差异只在「这一楼的 tag 从哪来」;装配上下文(世界书/角色库/位置 ID/写回/出图)
-    // 全部共用,故分叉只发生在请求这一步,见下。
+    // 提示词方式只决定「这次发给哪台模型」:内置/副 API 渠道,还是中转站那台。
+    // 协议(images/changes/transient 的 JSON)、上下文装配、验收、写回、出图全部同一份,
+    // 于是分叉只剩下面一个 if。
     const relayMode = profile.mode === 'relay';
 
-    /**
-     * 临时提示词:让模型从本楼正文读一次「此刻的穿戴/状态」。
-     *
-     * 两条提示词链共用这一步,而且它**不参与 tag 生成**——写完就落进
-     * chatMetadata,出图时由 generate.ts 追加到 CLIP 末尾(见 characterPrompts.ts)。
-     * 刻意不复用主请求:主请求要产出结构化 tag,再让它顺手维护一套穿戴账本,
-     * 模型会把「换了黑色蕾丝」写进固定档案,越用越歪。
-     *
-     * 失败一律吞掉(只 warn):临时状态是锦上添花,不该让整楼出图失败。
-     */
-    if (!slot && settings.autoTag.transientAutoRead) {
-      try {
-        await readTransientForFloor(floor, preparedTarget.segments.map(s => s.text).join('\n\n'), controller.signal);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          console.warn(`[YG 插图师] 第 ${floor} 楼读取临时提示词失败(不影响出图)`, error);
-        }
-      }
-    }
+
     // 失败重试:请求异常与「返回无法解析/校验不通过」都视为可重试的异常(后者常见于模型没遵守协议);
     // 中止信号立即收手,不消耗重试。parseImagePlan 对坏输出抛错,「无画面」则是正常返回空数组。
     // 解析/校验放进 validate 回调:不过则请求历史如实记为失败(而非「HTTP 拿到文本」的绿色成功),
@@ -449,6 +461,34 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     // 单槽重写不落 changes:首次全量分析已为整楼建过档,这里再应用一次只会产生
     // 重复的建档/变更记录;库文本已含本楼增量(见上面 entriesBefore),AI 照抄即可。
     const planOps = slot ? [] : planChangeOps(plan);
+
+    /**
+     * 角色档案(0.7):把本次 changes 落到**本聊天角色档案**(chatMetadata),
+     * 不再是楼层的 extra 增量。旧的重放模型(按楼层重算「第 N 楼时她什么样」)已经下线,
+     * 因为删楼/换 swipe 要全部重算,而用户手动改过的档案又会跟重放结果打架。
+     *
+     * 冻结档案(用户锁定的)一律不收 —— 与旧 lockedNames 同一口径。
+     */
+    if (!slot && plan.changes.length) {
+      const updates = plan.changes
+        .filter(change => !lockedNames.has(change.name))
+        .map(change => ({
+          name: change.name,
+          field: change.field,
+          value: change.value,
+          nl: change.nl ?? '',
+          reason: change.reason,
+        }));
+      const applied = applyProfileUpdates(updates, floor);
+      if (applied.created.length || applied.updated.length) {
+        diagnostic('profile:applied', {
+          floor,
+          created: applied.created,
+          updated: applied.updated,
+          unchanged: applied.unchanged,
+        });
+      }
+    }
     // 锁定角色(全局库)不接受 AI changes:丢弃,不写入楼层、不参与 @替换。
     // 重放侧 applyCharTagOps 也会按锁定名再拦一次(旧消息里可能已存这类 ops)。
     const effectiveOps = lockedNames.size
@@ -470,7 +510,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       if (profile.lockedSize) image.size = profile.lockedSize;
       const tagRes = applyPositionedCharRefs(
         image.tag,
-        anchors.entries,
+        entriesBefore,
         effectiveOps,
         image.sourceLine,
         'tag',
@@ -480,7 +520,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       if (image.nl) {
         const nlRes = applyPositionedCharRefs(
           image.nl,
-          anchors.entries,
+          entriesBefore,
           effectiveOps,
           image.sourceLine,
           'nl',
@@ -492,7 +532,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       for (const character of image.characters) {
         const charTag = applyPositionedCharRefs(
           character.tag,
-          anchors.entries,
+          entriesBefore,
           effectiveOps,
           image.sourceLine,
           'tag',
@@ -503,7 +543,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
         if (character.nl) {
           const charNl = applyPositionedCharRefs(
             character.nl,
-            anchors.entries,
+            entriesBefore,
             effectiveOps,
             image.sourceLine,
             'nl',
@@ -529,11 +569,16 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       return;
     }
     // 没有图片、没有角色变化、也没有旧楼层变化要清理时,保持原来的无写入早退。
-    if (!plan.images.length && !floorOps.length && !previousDelta) {
+    // 但 transient(这一刻的穿戴/状态)是独立于画面的信息:这一楼没画,穿戴照样变了,
+    // 下一楼出的图要按新衣服画。所以「本次有 transient 要落」时不许早退。
+    const transientOps = slot || !settings.autoTag.transientAutoRead ? [] : plan.transient;
+    if (!plan.images.length && !floorOps.length && !previousDelta && !transientOps.length) {
       if (opts.manual) toastr.info('模型认为本楼没有值得插图的画面', 'YG 插图师');
       else console.debug(`[YG·插图师] 第 ${floor} 楼无需插图`);
       return;
     }
+    // 穿戴状态先落盘:它不影响正文,写失败也只是一次 warn(锦上添花,不该拖垮出图)。
+    if (transientOps.length) applyTransientUpdates(transientOps, floor);
 
     // 触发 MESSAGE_EDITED / MESSAGE_UPDATED,卡片水合挂载时消费标记并自动开始生成
     // (见 floor/autoGenerate.ts);写回失败则撤销标记。
@@ -633,6 +678,67 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   }
 }
 
+/**
+ * 把同一次调用产出的 transient 落进 chatMetadata。
+ *
+ * 旧链路是「主请求之后再来一次专门的穿戴请求」,那份请求看不见主请求刚选的瞬间,
+ * 两方各写一套衣服;0.7 起 transient 就是协议里的一个键,写完这条记录画面与穿戴
+ * 天然一致,还省掉整整一次模型调用。
+ *
+ * 冻结的条目 AI 不许改,连「清空」也不许 —— 冻结的语义就是「由我说了算」。
+ */
+export interface TransientApplyResult {
+  /** 要写进临时词的角色(名字 → tag 串)。 */
+  updates: Array<{ name: string; prompt: string }>;
+  /** 要清空的角色名。 */
+  clears: string[];
+  /** 冻结条目被跳过的人数(仅用于日志排查,不参与写回)。 */
+  frozen: number;
+}
+
+/**
+ * 把协议里的 transient 换算成「谁要被改写、谁要被清空」。
+ *
+ * 纯函数:临时词的真实写入由调用方完成(runner 走 characterPromptStore,单测直接看返回值)。
+ * 冻结的条目在这一步就被剔掉 —— 冻结的语义是「由我说了算」,AI 连清空都不许。
+ */
+export function planTransientUpdates(
+  updates: TransientPromptUpdate[],
+  existing: Array<{ name: string; frozen?: boolean }>,
+): TransientApplyResult {
+  const result: TransientApplyResult = { updates: [], clears: [], frozen: 0 };
+  const known = new Map<string, { name: string; frozen?: boolean }>();
+  for (const entry of existing) known.set(entry.name, entry);
+  for (const item of updates) {
+    const current = known.get(item.name);
+    if (current?.frozen) {
+      result.frozen += 1;
+      continue;
+    }
+    if (item.cleared) {
+      // 本来就没有这条的「清空」是空操作:不写、也不留空键。
+      if (current) result.clears.push(item.name);
+      continue;
+    }
+    result.updates.push({ name: item.name, prompt: item.prompt });
+  }
+  return result;
+}
+
+function applyTransientUpdates(updates: TransientPromptUpdate[], floor: number): void {
+  const plan = planTransientUpdates(updates, temporaryPrompt.entries);
+  for (const name of plan.clears) clearTransient(name);
+  for (const item of plan.updates) setTransientForChar(item.name, item.prompt, { floor });
+  if (plan.updates.length || plan.clears.length) {
+    diagnostic('transient:applied', {
+      floor,
+      updated: plan.updates.length,
+      cleared: plan.clears.length,
+      frozen: plan.frozen,
+    });
+  }
+}
+
 function cancelAll(): void {
   diagnostic('cancelAll', { scheduled: scheduled.size, running: running.size });
   clearGeneration();
@@ -654,63 +760,6 @@ function scheduleForGeneratedFloor(floor: number, chatId: string): void {
   scheduled.add(timer);
 }
 
-/**
- * 临时提示词的独立读取:正文 → 一次模型调用 → 「角色: tag 串」→ 落 chatMetadata。
- *
- * 与主请求分开的理由见调用处注释(合并会让模型把换装写进固定档案)。
- * 送的是**本楼清洗后的正文**(不带历史、不带角色库):穿戴/伤势这类状态只跟「此刻这一段」有关,
- * 把前几楼一起塞进去反而会让它把上一套衣服写回来。
- */
-async function readTransientForFloor(
-  floor: number,
-  story: string,
-  signal: AbortSignal,
-): Promise<void> {
-  const known = charTagsBeforeFloor(floor + 1)
-    .map(entry => entry.name)
-    .filter(Boolean);
-  // 没有已知角色、也没有任何临时条目时没什么可读的:不让它凭空给路人建档
-  const tracked = known.length
-    ? known
-    : temporaryPrompt.entries.map(entry => entry.name);
-  if (!tracked.length || !story.trim()) return;
-
-  const messages: ChatMsg[] = [
-    { role: 'system', content: buildTransientTaskPrompt(tracked) },
-    { role: 'user', content: `【剧情正文】\n${story}` },
-  ];
-
-  // 渠道口径与主链路一致:指派了副 API 就走副 API,否则跟随主 API。
-  // 中转站模式同样改走中转站(它是用户为「读正文」这件事专门配的那台模型)。
-  const relayMode = settings.autoTag.prompts.mode === 'relay';
-  const channel = getTagGenChannel();
-  const raw = relayMode
-    ? await requestViaRelay(messages, { signal, source: `临时提示词(第 ${floor} 楼)` })
-    : channel
-      ? await requestCompletion(channel, messages, { signal, source: `临时提示词(第 ${floor} 楼)` })
-      : await requestViaMainApi(messages, { signal, source: `临时提示词(第 ${floor} 楼)` });
-
-  const parsed = parseTransientReply(raw, tracked);
-  if (!parsed.length) return;
-
-  let updated = 0;
-  let cleared = 0;
-  for (const item of parsed) {
-    const existing = temporaryPrompt.entries.find(entry => entry.name === item.name);
-    // 冻结的条目 AI 不许改,连「清空」也不许 —— 冻结的语义就是「由我说了算」
-    if (existing?.frozen) continue;
-    if (item.cleared) {
-      if (existing) {
-        clearTransient(item.name);
-        cleared += 1;
-      }
-      continue;
-    }
-    setTransientForChar(item.name, item.prompt, { floor });
-    updated += 1;
-  }
-  diagnostic('transient:applied', { floor, updated, cleared, parsed: parsed.length });
-}
 
 /**
  * 楼层按钮的手动入口。replace=true 用于「已有 tag 重新生成」:

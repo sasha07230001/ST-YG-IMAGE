@@ -24,12 +24,7 @@ import {
   withPrefill,
   type PurgeSettings,
 } from '@/relay/purge';
-import {
-  alternateRelayUrl,
-  normalizeRelayUrl,
-  unwrapPromptReply,
-  validatePrompt,
-} from '@/relay/prompt';
+import { alternateRelayUrl, normalizeRelayUrl } from '@/relay/prompt';
 
 export interface ChatMsg {
   role: 'system' | 'user' | 'assistant';
@@ -131,7 +126,9 @@ export function buildRelayBody(
     model: conn.model,
     messages,
     temperature: Number.isFinite(conn.temperature) ? conn.temperature : 0.8,
-    max_tokens: Number.isFinite(conn.maxTokens) ? conn.maxTokens : 400,
+    // 结构化 JSON(每张图的 tag/nl + changes 建档 + transient 穿戴)动辄上千 token:
+    // 400 会在建档那一轮把 JSON 截断在右括号之前,解析必然失败,一整次请求连同重试全白烧。
+    max_tokens: Number.isFinite(conn.maxTokens) ? conn.maxTokens : 4000,
     stream: false,
     tool_choice: 'none',
     presence_penalty: 0,
@@ -174,6 +171,11 @@ export interface RelayOptions {
   signal?: AbortSignal;
   /** 只有首个地址明确返回 404/405 时才换备用形式(/v1)重试一次。 */
   allowUrlFallback?: boolean;
+  /**
+   * 拿到文本后的验收钩子:与主 API / 副 API 两条链同一个契约(抛错 = 这次不算数)。
+   * 结构化协议下这里传 parseImagePlan 的包装;留空则不验收(连通性测试用)。
+   */
+  validate?: (content: string) => void;
 }
 
 /** 发一次补全,返回原始文本。 */
@@ -256,10 +258,14 @@ export async function compilePrompt(
     }
   };
 
+  // 0.7 起中转站也走同一份结构化协议(images/changes/transient 的 JSON)。这里不再按
+  // 「一行英文 tag」验收 —— 那套判据会把合法 JSON 判成不合格(JSON 里中文角色名一多就
+  // 触发「提示词以中文为主」)。验收统一交给调用方传进来的 validate(即 parseImagePlan),
+  // 与主 API / 副 API 两条链逐字同源。
   const accept = (raw: string): string => {
-    const text = unwrapPromptReply(raw);
-    const verdict = validatePrompt(text);
-    if (!verdict.ok) throw new RelayError(verdict.reason);
+    const text = raw.trim();
+    if (!text) throw new RelayError('中转站返回了空内容');
+    opts.validate?.(text);
     return text;
   };
 

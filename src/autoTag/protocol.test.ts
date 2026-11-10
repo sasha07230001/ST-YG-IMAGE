@@ -26,6 +26,7 @@ describe('auto tag position protocol', () => {
         { position: 'P1', sourceLine: 0, tag: 'first scene', nl: '', negative: '', characters: [], size: 'portrait' },
       ],
       changes: [],
+      transient: [],
     });
   });
 
@@ -44,6 +45,7 @@ describe('auto tag position protocol', () => {
     expect(parseImagePlanWithRange('{"images":[],"changes":[]}', segments, 0, 2)).toEqual({
       images: [],
       changes: [],
+      transient: [],
     });
   });
 
@@ -68,6 +70,7 @@ describe('auto tag position protocol', () => {
     expect(parseImagePlan('{"images":[{"position":"P1","prompt":"scene"}]}', segments, 1)).toEqual({
       images: [{ position: 'P1', sourceLine: 0, tag: 'scene', nl: '', negative: '', characters: [], size: 'portrait' }],
       changes: [],
+      transient: [],
     });
   });
 
@@ -86,6 +89,7 @@ describe('auto tag position protocol', () => {
         },
       ],
       changes: [],
+      transient: [],
     });
   });
 
@@ -116,6 +120,7 @@ describe('auto tag position protocol', () => {
         { position: 'P1', sourceLine: 0, tag: '2girls', nl: '', negative: '', characters: [], size: 'landscape' },
       ],
       changes: [],
+      transient: [],
     });
   });
 
@@ -359,6 +364,76 @@ describe('changes parsing', () => {
     expect(parseImagePlan('{"images":[],"changes":[]}', segments, 1)).toEqual({
       images: [],
       changes: [],
+      transient: [],
     });
+  });
+});
+
+/**
+ * 单次调用协议(0.7):images / changes / transient 挤在同一份 JSON 里。
+ *
+ * 为什么这一段必须锁死:transient 以前是紧随主请求的**第二次**模型调用,
+ * 它看不见本次选中的那一瞬间,于是「画面里穿白裙、档案里写黑蕾丝」这种打架
+ * 只能靠用户自己发现。合并之后唯一的护栏就是这里——同一个 JSON 里同时给出
+ * 画面与穿戴,而且两者的边界(临时更换 vs 永久变化)由协议本身分开。
+ */
+describe('auto tag transient 协议', () => {
+  it('把 transient 解析成 {name,prompt,cleared},与 images 并列', () => {
+    const raw = JSON.stringify({
+      images: [{ position: 'P1', tag: '1girl, white dress, sitting' }],
+      changes: [],
+      transient: { 小雪: 'white dress, long sleeves, sitting', 阿岚: '' },
+    });
+    const plan = parseImagePlan(raw, segments, 2);
+    expect(plan.images).toHaveLength(1);
+    expect(plan.transient).toEqual([
+      { name: '小雪', prompt: 'white dress, long sleeves, sitting', cleared: false },
+      // 空串 = 「她现在没穿」,不是「沿用上次」——两者的区别就是 cleared 这一位
+      { name: '阿岚', prompt: '', cleared: true },
+    ]);
+  });
+
+  it('也吃 transientState 这个别名:模型常把它写成更长的名字', () => {
+    const raw = JSON.stringify({
+      images: [{ position: 'P1', tag: '1girl' }],
+      transientState: { 小雪: 'navy school blazer' },
+    });
+    expect(parseImagePlan(raw, segments, 2).transient).toEqual([
+      { name: '小雪', prompt: 'navy school blazer', cleared: false },
+    ]);
+  });
+
+  it('没写 transient 时是空数组,不是 undefined', () => {
+    const raw = JSON.stringify({ images: [{ position: 'P1', tag: '1girl' }], changes: [] });
+    expect(parseImagePlan(raw, segments, 2).transient).toEqual([]);
+  });
+
+  it('transient 里的垃圾值(字符串/数组/嵌套对象)一律丢掉,不连累整份计划', () => {
+    const raw = JSON.stringify({
+      images: [{ position: 'P1', tag: '1girl' }],
+      transient: ['nonsense'],
+    });
+    expect(parseImagePlan(raw, segments, 2).transient).toEqual([]);
+    expect(parseImagePlan(raw, segments, 2).images).toHaveLength(1);
+  });
+
+  it('穿戴与建档可以同时出现:一个进 transient,一个进 changes', () => {
+    const raw = JSON.stringify({
+      images: [{ position: 'P2', tag: '1girl, black lace dress' }],
+      changes: [
+        {
+          name: '小雪',
+          field: 'outfit',
+          value: 'black lace dress, thighhighs',
+          position: 'P2',
+          reason: '从此只穿这一套',
+        },
+      ],
+      transient: { 小雪: 'black lace dress' },
+    });
+    const plan = parseImagePlan(raw, segments, 2);
+    expect(plan.transient).toHaveLength(1);
+    expect(plan.changes).toHaveLength(1);
+    expect(plan.changes[0].field).toBe('outfit');
   });
 });

@@ -5,8 +5,7 @@ import BbiTextarea from '@/components/BbiTextarea.vue';
 import Collapsible from '@/components/Collapsible.vue';
 import Icon from '@/components/Icon.vue';
 import { compilePrompt, fetchRelayModels, testRelayConnection } from '@/relay/client';
-import { normalizeRelayUrl, renderTemplate, validatePrompt } from '@/relay/prompt';
-import { planSegments } from '@/relay/split';
+import { normalizeRelayUrl } from '@/relay/prompt';
 import {
   DEFAULT_PREFILL_TEXT,
   DEFAULT_PURGE_PROMPT,
@@ -17,22 +16,26 @@ import {
   type TagPromptMode,
 } from '@/state/settings';
 import { prepareTargetText } from '@/autoTag/clean';
+import { buildAutoTagMessages, autoTagProfile } from '@/autoTag/prompt';
+import { parseImagePlan } from '@/autoTag/protocol';
 import { getContext, isAiStoryMessage } from '@/st/context';
 import { parseImageTags, stripImageTags } from '@/st/imageTagRegex';
 
 /**
- * 「中转站」页:正文先交给一个 OpenAI 兼容模型编译成 CLIP 提示词,再写进楼层 tag。
+ * 「中转站」页:给整条提示词链换一台模型(OpenAI 兼容端点)。
  *
- * 这一页只做三件事:
- * 1. 选提示词方式(内置 LLM 分析 / 中转站编译)——这是全插件唯一的口径开关;
+ * 0.7 起这里不再是「另一条链」:协议(images/changes/transient 的 JSON)、上下文装配、
+ * 角色固定外貌库、建档规则、验收、写回楼层 tag、出图全部与内置 LLM 同一份代码,
+ * 唯一差别是这次请求发到哪台模型。所以这一页只做三件事:
+ * 1. 选这台模型还是内置 —— 全插件唯一的模型出口开关;
  * 2. 配置中转站(地址/密钥/模型/温度/超时/拉模型/测试);
- * 3. 编辑编译提示词与恒定词,并给一个「自检」按钮:用当前楼梯正文跑一遍,
- *    把最终会写进 tag 的那串原样显示出来——不烧出图渠道就能验证编译结果。
+ * 3. 编辑这一轮的开场身份与书写规范,并给一个「自检」按钮:用当前楼梯正文真跑一遍,
+ *    把最终会写进 tag 的那份 JSON 原样显示出来——不烧出图渠道就能验证协议。
  */
 
 const MODE_OPTIONS: { value: TagPromptMode; label: string }[] = [
-  { value: 'builtin', label: '内置 LLM 分析' },
-  { value: 'relay', label: '中转站编译' },
+  { value: 'builtin', label: '内置 LLM' },
+  { value: 'relay', label: '中转站模型' },
 ];
 
 const mode = computed<TagPromptMode>({
@@ -132,6 +135,7 @@ const DIAGNOSTIC_PREFIX = '[YG][RelaySelfCheck]';
 const checking = ref(false);
 const checkOutput = ref('');
 const checkError = ref('');
+const checkSummary = ref('');
 
 interface SelfCheckFloor {
   floor: number;
@@ -152,10 +156,12 @@ function latestAiFloor(): SelfCheckFloor | null {
 }
 
 /**
- * 自检:同一段正文 → 分段 → 编译(走与正式链路同一份 prompt 组装 + 同一份清洗/验收)。
+ * 自检:同一段正文 → 与正式链路同一份消息装配 → 真跑一次 → 用同一份协议解析。
  *
  * 刻意不写正文、不出图:这一步只是让用户看见「模型会给我什么」。
- * 请求体与正式链路完全同源(relay/client.ts),所以自检通过就基本等于正式可用。
+ * 0.7 起它不再是「纯文本编译」的小路:它调用 buildAutoTagMessages(与 runner 同一函数,
+ * 带 jailbreak/角色卡/世界书/规范/建档规则/示例 JSON)并用 parseImagePlan 验收,
+ * 所以自检通过 ≈ 正式链路能解析;自检报的错就是出图时会真报的那个错。
  */
 async function runSelfCheck(): Promise<void> {
   if (checking.value) return;
@@ -177,24 +183,23 @@ async function runSelfCheck(): Promise<void> {
       checkError.value = '这一楼清洗后没有剩下正文';
       return;
     }
-    const story = prepared.segments.map(s => s.text).join('\n\n');
-    const segments = planSegments(story, {
-      count: Math.max(1, settings.autoTag.minImages || 1),
-      mark: relay.segmentMark,
-    });
-    const first = segments[0]?.text ?? story;
-    const values = {
-      story: first,
-      note: segments.length > 1 ? `本次只画第 1/${segments.length} 张。` : '',
-      mark: relay.segmentMark,
-      index: 0,
-      count: segments.length,
-      orientation: null,
-    };
-    const system = `${renderTemplate(settings.autoTag.prompts.relaySystem.trim() || DEFAULT_RELAY_SYSTEM, values)}\n\n${
-      settings.autoTag.prompts.relaySpec.trim() || DEFAULT_RELAY_SPEC
-    }`;
-    const compiled = await compilePrompt(
+    const ctx = getContext();
+    if (!ctx) {
+      checkError.value = '拿不到当前聊天上下文';
+      return;
+    }
+    const profile = autoTagProfile();
+    const messages = await buildAutoTagMessages(
+      ctx,
+      picked.floor,
+      settings.autoTag,
+      null,
+      prepared,
+      null,
+      '',
+      profile,
+    );
+    const raw = await compilePrompt(
       {
         url: relay.url,
         key: relay.key,
@@ -204,18 +209,30 @@ async function runSelfCheck(): Promise<void> {
         timeoutSec: relay.timeoutSec,
         purge: relay.purge,
       },
-      [
-        { role: 'system', content: system },
-        { role: 'user', content: `请把上面的剧情编译成提示词。可选位置 ID:${prepared.segments.map(s => s.id).join('、')}` },
-      ],
+      messages,
       { allowUrlFallback: true },
     );
-    const verdict = validatePrompt(compiled);
-    checkOutput.value = compiled;
-    if (!verdict.ok) checkError.value = verdict.reason;
-    console.info(`${DIAGNOSTIC_PREFIX} floor=${picked.floor} segments=${segments.length} len=${compiled.length}`);
+    checkOutput.value = raw.trim();
+    // 与 runner 完全同一个解析器 + 同样的上下限:少一张、位置算歪、建档缺字段都会在这里报。
+    const plan = parseImagePlan(
+      raw,
+      prepared.segments,
+      Math.max(0, settings.autoTag.minImages),
+      Math.max(1, settings.autoTag.maxImages),
+    );
+    const shots = plan.images.map(img => `${img.position} ${img.size ?? '-'}`).join(' / ');
+    console.info(
+      `${DIAGNOSTIC_PREFIX} floor=${picked.floor} segments=${prepared.segments.length} ` +
+        `images=${plan.images.length} changes=${plan.changes.length} transient=${plan.transient.length} len=${raw.length}`,
+    );
+    if (!plan.images.length) checkError.value = '协议解析通过,但这楼没有选中任何画面(images 为空)';
+    else if (plan.images.length < Math.max(0, settings.autoTag.minImages))
+      checkError.value = `只给出 ${plan.images.length} 张,少于设置的最少 ${settings.autoTag.minImages} 张`;
+    else checkError.value = '';
+    checkSummary.value = `解析通过:${plan.images.length} 张( ${shots} ),建档/永久变化 ${plan.changes.length} 条,穿戴 ${plan.transient.length} 条`;
   } catch (error) {
     checkError.value = error instanceof Error ? error.message : String(error);
+    checkSummary.value = '';
   } finally {
     checking.value = false;
   }
@@ -242,8 +259,8 @@ const comfyWorkflowHasPlaceholder = computed(() => {
     <header class="bbi-page-head">
       <h2 class="bbi-title bbi-title-sub">中转站</h2>
       <p class="bbi-page-intro">
-        正文先交给一个 OpenAI 兼容模型编译成 CLIP 提示词,再写进楼层 tag、交给出图渠道。
-        与「内置 LLM 分析」共用楼层卡片、出图、图库与队列,只是提示词从另一条链来。
+        正文交给一个 OpenAI 兼容模型完成同一件事:选画面、写 tag、维护角色固定外貌库、编译成英文提示词。
+        协议与内置 LLM 完全同一份 —— 楼层卡片、出图、图库与队列也共用,差的只是这次请求发给哪台模型。
       </p>
     </header>
 
@@ -267,10 +284,13 @@ const comfyWorkflowHasPlaceholder = computed(() => {
           </div>
         </div>
         <p class="bbi-field-hint">
-          <strong>内置 LLM 分析</strong>:沿用插件原本那条链——独立一次 LLM 请求,模型按结构化协议
-          选画面、写 tag、维护角色固定外貌库,再写进正文。<br />
-          <strong>中转站编译</strong>:正文直接交给中转站模型,让它编译成一行英文 CLIP 提示词;
-          这条链不产出角色建档,画面完全由编译结果与下面的恒定词决定。
+          这条开关只决定 <strong>这一次请求发给哪台模型</strong>。两条口径下协议完全相同:
+          都是「选画面 + 写 tag + 维护角色固定外貌库 + 记录这一刻的穿戴」的一次调用,
+          返回同一份带 <code>images</code> / <code>changes</code> / <code>transient</code> 的 JSON,
+          写回正文的方式、验收标准与出图路径也一字不差。<br />
+          <strong>内置 LLM</strong>:走设置页「生成 tag 使用」那个渠道(主 API 或副 API)。<br />
+          <strong>中转站模型</strong>:改由下面填的 OpenAI 兼容端点承担同一次调用 ——
+          模型更便宜/更准时换这里,协议不会变,角色库与建档规则照样生效。
         </p>
       </Collapsible>
 
@@ -368,20 +388,22 @@ const comfyWorkflowHasPlaceholder = computed(() => {
       </Collapsible>
 
       <!-- 编译提示词 -->
-      <Collapsible title="编译提示词" :open="mode === 'relay' && false">
+      <Collapsible title="开场身份与书写规范" :open="false">
         <div class="bbi-field-head">
           <span class="bbi-field-label">system 提示词</span>
           <button class="bbi-btn bbi-btn-sm" type="button" @click="resetSystem">恢复默认</button>
         </div>
         <p class="bbi-field-hint">
+          这里是这次调用的<strong>开场身份</strong>,排在破限词之后、角色卡与世界书之前;
+          内置那条结构化契约(选画面 / 建档 / 示例 JSON)照旧跟在后面,两者是叠加关系。
           占位符:<code>{{ PLACEHOLDER_HINTS.story }}</code> 剧情正文、<code>{{ PLACEHOLDER_HINTS.note }}</code> 任务提示、
           <code>{{ PLACEHOLDER_HINTS.index }}</code>/<code>{{ PLACEHOLDER_HINTS.count }}</code> 第几张、
-          <code>{{ PLACEHOLDER_HINTS.orientation }}</code> 画幅。留空用内置默认。
+          <code>{{ PLACEHOLDER_HINTS.orientation }}</code> 画幅。留空 = 不追加开场身份(与内置链一字不差)。
           另支持 <code>{{ PLACEHOLDER_HINTS.nlOpen }}…{{ PLACEHOLDER_HINTS.nlClose }}</code> 条件段,按「生成自然语言」开关取舍。
         </p>
-        <BbiTextarea v-model="systemDraft" :rows="12" placeholder="留空 = 内置默认" />
+        <BbiTextarea v-model="systemDraft" :rows="12" placeholder="留空 = 不追加,只用内置契约" />
         <p class="bbi-field-state">
-          {{ settings.autoTag.prompts.relaySystem.trim() ? '已自定义' : '默认' }} ·
+          {{ settings.autoTag.prompts.relaySystem.trim() ? '已自定义' : '默认(空)' }} ·
           {{ effectiveSystem.length }} 字
         </p>
 
@@ -392,38 +414,23 @@ const comfyWorkflowHasPlaceholder = computed(() => {
           <button class="bbi-btn bbi-btn-sm" type="button" @click="resetSpec">恢复默认</button>
         </div>
         <p class="bbi-field-hint">
-          追加在 system 之后的书写规范:标准 danbooru 词、数量约束、多人绑定、禁止字面量。
-          留空用内置默认;清成空串仍然保留默认(想彻底不要规范就填一个空格)。
+          追加在 system 之后的<strong>书写规范</strong>:标准 danbooru 词、数量约束、多人绑定、禁止字面量。
+          与后端规范(ComfyUI / NAI)同时生效,不互相替代。
         </p>
-        <BbiTextarea v-model="specDraft" :rows="8" placeholder="留空 = 内置默认" />
+        <BbiTextarea v-model="specDraft" :rows="8" placeholder="留空 = 不追加" />
         <p class="bbi-field-state">
-          {{ settings.autoTag.prompts.relaySpec.trim() ? '已自定义' : '默认' }} · {{ effectiveSpec.length }} 字
+          {{ settings.autoTag.prompts.relaySpec.trim() ? '已自定义' : '默认(空)' }} · {{ effectiveSpec.length }} 字
         </p>
       </Collapsible>
 
       <!-- 恒定画风 / 负面词 -->
       <Collapsible title="恒定词与画幅" :open="false">
-        <div class="bbi-field">
-          <div class="bbi-field-head"><span class="bbi-field-label">恒定画风词</span></div>
-          <input v-model="relay.styleSuffix" class="bbi-input" type="text" placeholder="masterpiece, best quality, anime style" />
-          <p class="bbi-field-hint">
-            <strong>前置</strong>在正向提示词最前面:CLIP 对越靠前的 token 越敏感,不少工作流只吃前 75 个 token。
-            留空 = 不追加。内置链的恒定词在「渠道」页各后端里,这里只作用于中转站这条链。
-          </p>
-        </div>
-
-        <div class="bbi-field">
-          <div class="bbi-field-head"><span class="bbi-field-label">恒定负面词</span></div>
-          <input v-model="relay.negative" class="bbi-input" type="text" placeholder="lowres, bad anatomy, …" />
-          <p class="bbi-field-hint">同样前置在负面提示词最前面;合成本身按小写去重,不会出现两遍。</p>
-        </div>
-
-        <label class="bbi-switch-row">
-          <span class="bbi-field-label">让模型额外输出负面词</span>
-          <input v-model="relay.wantNegative" type="checkbox" class="bbi-checkbox" />
-        </label>
         <p class="bbi-field-hint">
-          开启后要求模型用 <code>POSITIVE:</code> / <code>NEGATIVE:</code> 分段;负面与恒定负面词合成后写入负面通道。
+          <strong>恒定画风词与恒定负面词已不再由这一页管。</strong>
+          正向提示词现在统一按「固定正面 → 角色 → 剧情」三层合成后写进
+          <code>%prompt%</code>:固定正面取「渠道」页当前工作流的「提示词」那一格,
+          角色层来自角色固定外貌库(常驻 + 这一刻的穿戴),剧情层就是 AI 编译出的画面词。
+          想让某些词永远排在最前,填那一格即可,两条链都会照办。
         </p>
 
         <hr class="bbi-rule" />
@@ -454,7 +461,7 @@ const comfyWorkflowHasPlaceholder = computed(() => {
         <p class="bbi-field-hint">
           {{ comfyPresetName }} ·
           {{ comfyWorkflowHasPlaceholder
-            ? '写入了 %prompt% 占位符,按占位符逐字替换。'
+            ? '写入了 %prompt% 占位符,三层合成的那一串按占位符逐字替换。'
             : '没有 %prompt% 占位符,客户端会自动找到 CLIPTextEncode 节点写入(正向写第一个,负面写带负面词的那个)。' }}
         </p>
       </Collapsible>

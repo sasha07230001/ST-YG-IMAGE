@@ -352,3 +352,77 @@ export function buildTransientTaskPrompt(known: string[]): string {
 6. 只输出 JSON,不要解释、不要 Markdown 代码块,格式:
 {"角色名":"tag 串"}`;
 }
+
+/* ============ 在场角色判定 ============ */
+
+/** 英文 tag 里的名字要按「词边界」比,否则 \`rin\` 会被 \`grinning\` 命中。 */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 名字在提示词里出现过吗;ASCII 名字要求两侧不是字母数字(避免 `rin` 被 `grinning` 命中)。
+ *
+ * `exclude` 是已经算给更长名字的字符区间:先在提示词里把这几个区间抹成等长占位再找,
+ * 短名才不会把「小雪乃」当成自己。抹成占位而不是删掉,是为了不打乱后面的下标。
+ */
+function mentions(
+  prompt: string,
+  name: string,
+  exclude: Array<{ at: number; len: number }> = [],
+): boolean {
+  if (!name) return false;
+  let text = prompt;
+  for (const span of [...exclude].sort((a, b) => b.at - a.at)) {
+    text = text.slice(0, span.at) + '\u0000'.repeat(span.len) + text.slice(span.at + span.len);
+  }
+  if (!/[\x00-\x7f]/.test(name)) return text.includes(name);
+  const pattern = new RegExp(
+    `(?<![A-Za-z0-9_])${escapeRegExp(name)}(?![A-Za-z0-9_])`,
+    'i',
+  );
+  return pattern.test(text);
+}
+
+/**
+ * 本图到底画了谁 —— 角色层取词的白名单。
+ *
+ * 为什么需要单独一步:ComfyUI 链路从不传 characters[](那是 NAI 4.5/V5 才有的结构化
+ * 多角色字段),resolveCharacterPrompts 收到的 present 恒为空数组,于是它只返回
+ * 「通用常驻词」,每个角色的固定外貌与临时穿戴全被丢掉 —— 表面上像是**角色提示词没被
+ * 注入**,其实上游压根没告诉它画的是谁。
+ *
+ * 判定先用最保守、最便宜的信号:AI 刚按这一瞬间写出的提示词本身。
+ *   - 结构化角色名一律算在场(NAI 链路,以及手动编辑弹窗里点名的那些);
+ *   - 名字出现在提示词里就算在场(tag 英文名、nl 里的中文名都算);
+ *   - 名字是库里另一个更长名字的前缀时**不算**并继续往后找(避免「小雪」把「小雪乃」拖进来);
+ *   - 长名优先,短名在后,减少前缀吃掉整个名字的机会。
+ *
+ * 一个角色都没认出来时返回空数组 —— 调用方据此只发通用常驻词。
+ * 宁可少带一个人,也不要把没出场的角色的套装穿到别人身上(那是凭空多一个人的头号成因)。
+ */
+export function pickPresentNames(
+  candidates: Array<string | undefined | null>,
+  prompt: string,
+): string[] {
+  const names = [...new Set(candidates.map(name => String(name ?? '').trim()).filter(Boolean))];
+  if (!names.length) return [];
+  const haystack = String(prompt ?? '');
+  if (!haystack.trim()) return [];
+  // 长名优先:先匹配「小雪乃」再匹配「小雪」
+  const ordered = [...names].sort((a, b) => b.length - a.length);
+  const claimed: string[] = [];
+  /** 已经算给更长名字的字符区间:同一段字不能被短名再算一次。 */
+  const spans: Array<{ at: number; len: number }> = [];
+  for (const name of ordered) {
+    if (!mentions(haystack, name, spans)) continue;
+    claimed.push(name);
+    let at = haystack.indexOf(name);
+    while (at >= 0) {
+      spans.push({ at, len: name.length });
+      at = haystack.indexOf(name, at + name.length);
+    }
+  }
+  // 输出保持候选原顺序,让提示词里的角色次序稳定(同一个人不会每次换位置)
+  return names.filter(name => claimed.includes(name));
+}

@@ -34,6 +34,16 @@ import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import PromptSendPreview from '@/components/PromptSendPreview.vue';
 import {
+  basePrompt,
+  hydrateCharacterPrompts,
+  listCharacterPromptRows,
+  removeBaseForChar,
+  setBaseForChar,
+  setBaseGeneral,
+  setBaseEnabled,
+} from '@/state/characterPromptStore';
+import { chatProfiles, lastRememberedStory, profileEntryTag, resolvePresentProfiles } from '@/state/charProfiles';
+import {
   activeComfyPreset,
   effectiveComfyConn,
   newComfyWorkflow,
@@ -53,6 +63,96 @@ const confirmDeleteOpen = ref(false);
 
 /** 本渠道是否为当前出图渠道;「使用此渠道」按钮与设置页选择器、页签徽标同属一个开关。 */
 const inUse = computed(() => settings.defaultBackend === 'comfyui');
+
+/* ============ 角色提示词(渠道页可见列表) ============ */
+
+/**
+ * 角色层不再是一个黑箱:本聊天角色档案里的每个角色都在这里列一行,
+ * 左边是档案给的固定外貌(AI 维护,只读),右边是用户手写的追加词(可写)。
+ * 分层拼接的角色层**直接调用这份列表** —— 界面上看见什么,发出去的的就是什么,
+ * 不再有「预览一套、实发另一套」的余地。
+ */
+hydrateCharacterPrompts();
+
+/** 手写追加词的本地草稿:边打边存会每字符写一次 chatMetadata,故节流到失焦/回车。 */
+const characterDraft = ref<Record<string, string>>({});
+
+const characterRows = computed(() => {
+  const rows = listCharacterPromptRows();
+  const seen = new Set(rows.map(row => row.name));
+  // 档案里已有、但还没有手写词也没有临时词的角色也要露面:否则用户看不到「她其实在列」。
+  for (const entry of chatProfiles.entries) {
+    const tag = profileEntryTag(entry);
+    if (!tag || seen.has(entry.name)) continue;
+    seen.add(entry.name);
+    rows.push({
+      name: entry.name,
+      profile: tag,
+      override: '',
+      transient: '',
+      frozen: false,
+      effective: tag,
+    });
+  }
+  return rows;
+});
+
+/** 本次认得出在场的角色(AI 读正文那次/最近一次编译),用来给行加「在场」标记。 */
+const presentNow = computed(() => resolvePresentProfiles({ story: lastRememberedStory() }));
+
+function isPresent(name: string): boolean {
+  const key = name.trim().toLowerCase();
+  return presentNow.value.some(item => item.toLowerCase() === key);
+}
+
+function draftOf(name: string): string {
+  const key = name.trim();
+  if (key in characterDraft.value) return characterDraft.value[key];
+  return String(basePrompt.byChar[key] ?? '');
+}
+
+function onCharacterInput(name: string, value: string): void {
+  characterDraft.value = { ...characterDraft.value, [name.trim()]: value };
+}
+
+function commitCharacter(name: string): void {
+  const key = name.trim();
+  if (!key) return;
+  const value = draftOf(key);
+  if (value === String(basePrompt.byChar[key] ?? '')) {
+    const next = { ...characterDraft.value };
+    delete next[key];
+    characterDraft.value = next;
+    return;
+  }
+  setBaseForChar(key, value);
+  const next = { ...characterDraft.value };
+  delete next[key];
+  characterDraft.value = next;
+}
+
+function clearCharacterOverride(name: string): void {
+  removeBaseForChar(name);
+  const next = { ...characterDraft.value };
+  delete next[name.trim()];
+  characterDraft.value = next;
+}
+
+/** 常驻通用段(不分角色)。 */
+const generalDraft = ref(basePrompt.general ?? '');
+
+function commitGeneral(): void {
+  setBaseGeneral(generalDraft.value);
+}
+
+/** 角色层最终会发出去的那一串(与出图同一份实现)。 */
+const characterLayerText = computed(() =>
+  characterRows.value
+    .filter(row => isPresent(row.name) || !!row.effective.trim())
+    .map(row => row.effective.trim())
+    .filter(Boolean)
+    .join(', '),
+);
 
 /* ============ 分层拼接 ============ */
 
@@ -78,9 +178,24 @@ const layerSummary = computed(() => {
   const order = normalizeLayerOrder(simple.layerOrder)
     .map(id => LAYER_LABELS[id])
     .join(' → ');
-  return `三层:${order}${budget}${dedupe}`;
+  // 自定义模式没有 CLIPTextEncode 可写,这一串会整体塞进工作流的 %prompt%
+  // (见 generate.ts composeCustomPositive),所以摘要要说明出口,免得用户以为没生效。
+  const outlet = active.value.mode === 'custom' ? ' → %prompt%' : '';
+  return `三层:${order}${budget}${dedupe}${outlet}`;
 });
 
+/**
+ * 负面这一次能不能真的送进工作流。
+ *
+ * 判据是**占位符**而不是模板能力:简易模式由后端把两段负面拼进负向 CLIPTextEncode,
+ * 一定有位置;自定义模式只有工作流里写了 %negative_prompt% 才有位置 —— 没有就是没有,
+ * 填了也不会生效,预览必须直说(以前这里拿 meta.supportsNegative 判断,
+ * 于是 Flux 自定义工作流明明有 %negative_prompt% 也被标成「不送达」,反向误导)。
+ */
+const negativeReachesWorkflow = computed(() => {
+  if (active.value.mode !== 'custom') return meta.value.supportsNegative;
+  return getWorkflowPlaceholders(active.value.workflow).includes('negative_prompt');
+});
 /** 层顺序的本地读写口;拖拽只改这个预设自己的 simple.layerOrder。 */
 const layerOrder = computed<PromptLayerId[]>({
   get: () => normalizeLayerOrder(active.value.simple.layerOrder),
@@ -768,29 +883,139 @@ function applyAssist() {
             </div>
           </section>
 
+        </template>
+
+        <!-- 自定义模式:粘贴 API 格式 JSON -->
+        <template v-else>
+        <div class="wf-json-head">
+          <span class="bbi-field-label">工作流 JSON</span>
+          <span class="wf-json-tools">
+            <span
+              class="bbi-prompt-state wf-state"
+              :class="`is-${workflowState.tone}`"
+              :title="workflowState.detail || undefined"
+            >
+              {{ workflowState.text }}
+            </span>
+            <button
+              class="bbi-btn bbi-btn-primary bbi-btn-sm"
+              type="button"
+              :disabled="configuring || !active.workflow.trim()"
+              title="AI 判断节点用途并自动配置占位符；工作流节点、模型名和本地路径会发送给设置页「生成 tag 使用」的 API"
+              @click="onAutoConfigure"
+            >
+              <Icon name="sparkles" :size="12" />
+              {{ configuring ? '分析中…' : 'AI 自动配置' }}
+            </button>
+          </span>
+        </div>
+        <BbiTextarea
+          v-model="active.workflow"
+          :rows="8"
+          :max-rows="24"
+          mono
+          placeholder='{"3": {"class_type": "KSampler", ...}, ...}'
+        />
+        <p class="bbi-field-hint wf-hint">
+          「Save (API Format)」导出；可用 %prompt% %negative_prompt% %seed% %nl% %width% %height%
+        </p>
+        </template>
+
           <section class="wf-group">
             <div class="wf-group-head">
               <span class="bbi-field-label">提示词</span>
               <span class="wf-layer-summary">{{ layerSummary }}</span>
             </div>
-            <div class="wf-prompts">
-              <BbiTextarea
-                v-model="active.simple.positive"
-                :rows="2"
-                :max-rows="6"
-                placeholder="固定正面:质量词/风格词等,拼在 AI 生成内容之前"
-              />
-              <BbiTextarea
-                v-if="meta.supportsNegative"
-                v-model="active.simple.negative"
-                :rows="2"
-                :max-rows="6"
-                placeholder="固定负面:通用负面词;AI 生成的动态负面追加在后"
-              />
+            <p class="wf-layer-hint">
+              这两格是<b>固定词</b>,两种模式同一份:简易模式拼进 CLIP,自定义模式拼进
+              %prompt% / %negative_prompt%。留空就是不加。
+            </p>
+            <label class="bbi-field-label wf-prompt-label">正面提示词(固定正面)</label>
+            <BbiTextarea
+              v-model="active.simple.positive"
+              :rows="2"
+              :max-rows="6"
+              placeholder="质量词/画风词/画师词,例如 masterpiece, best quality, photorealistic"
+            />
+            <label class="bbi-field-label wf-prompt-label">负面提示词(固定负面)</label>
+            <BbiTextarea
+              v-model="active.simple.negative"
+              :rows="2"
+              :max-rows="6"
+              placeholder="通用负面词,例如 lowres, bad anatomy, bad hands, worst quality"
+            />
+            <p class="wf-layer-hint">
+              工作流里有 %negative_prompt% 时写进去,AI 按本图编的排除词追加在后;
+              没有该占位符就只在预览里显示(你也可以手动加一个)。
+            </p>
+
+            <!--
+              角色提示词:本聊天角色档案里每个角色一行。
+              左格是档案给的固定外貌(AI 维护,只读),右格是用户追加词(可写)。
+              分层拼接的角色层直接吃这份列表 —— 看得见什么就是发出什么。
+            -->
+            <div class="wf-char-head">
+              <label class="bbi-field-label wf-prompt-label">角色提示词(来自「角色档案」页的本聊天档案)</label>
+              <span class="wf-layer-summary">{{ characterRows.length }} 个角色</span>
             </div>
+            <p class="wf-layer-hint">
+              档案里有什么,这里就列什么:左边那段是 AI 按剧情维护的固定外貌(只读),
+              右边那格是你可以随时补的追加词(存进本聊天的常驻词)。分层拼接的角色层
+              直接调用这份列表,不再另算一遍。改完按回车或点别处即保存。
+            </p>
+            <label class="wf-switch">
+              <input
+                v-model="basePrompt.enabled"
+                type="checkbox"
+                class="bbi-checkbox"
+                @change="setBaseEnabled(basePrompt.enabled)"
+              />
+              <span>角色层参与拼接(关掉 = 只发固定正面 + 剧情)</span>
+            </label>
+            <div v-if="!characterRows.length" class="wf-char-empty">
+              这个聊天还没有角色档案。到「角色档案」页加一条档案库角色,填上正文里会出现的名字/称呼,
+              正文提到它时就会自动播种到本聊天。
+            </div>
+            <div v-else class="wf-char-list">
+              <div v-for="row in characterRows" :key="row.name" class="wf-char-row">
+                <div class="wf-char-name">
+                  <span>{{ row.name }}</span>
+                  <span v-if="isPresent(row.name)" class="wf-char-pill">在场</span>
+                  <span v-if="row.frozen" class="wf-char-pill is-muted">穿戴已冻结</span>
+                </div>
+                <div class="wf-char-profile">{{ row.profile || '（档案里还没有外貌词）' }}</div>
+                <BbiTextarea
+                  :model-value="draftOf(row.name)"
+                  :rows="2"
+                  :max-rows="4"
+                  placeholder="追加词(可选):例如 always wearing a white lab coat"
+                  @update:model-value="value => onCharacterInput(row.name, value)"
+                  @blur="commitCharacter(row.name)"
+                />
+                <div v-if="row.transient" class="wf-char-transient">
+                  此刻穿戴:{{ row.transient }}
+                </div>
+                <div class="wf-char-foot">
+                  <span class="wf-char-effective">进角色层:{{ row.effective || '（空）' }}</span>
+                  <button
+                    v-if="row.override"
+                    class="bbi-btn bbi-btn-sm"
+                    type="button"
+                    @click="clearCharacterOverride(row.name)"
+                  >
+                    清空追加词
+                  </button>
+                </div>
+              </div>
+            </div>
+            <p v-if="characterLayerText" class="wf-layer-hint">
+              角色层成品串:
+              <code>{{ characterLayerText }}</code>
+            </p>
           </section>
 
           <!-- 分层拼接:决定「固定正面 / 角色 / 剧情」三段的插入位次与合并规则。
+               两种模式共用:简易模式拼进 CLIP,自定义模式拼进 %prompt%(见 generate.ts)。
                默认顺序是 固定正面 → 角色 → 剧情(见 backends/promptLayers.ts 的 LAYER_ORDER),
                顺序可拖动;连带着去重的赢家和预算被砍的层一起变。 -->
           <section class="wf-group">
@@ -809,11 +1034,12 @@ function applyAssist() {
             </div>
             <label class="wf-switch">
               <input v-model="active.simple.layered" type="checkbox" class="bbi-checkbox" />
-              <span>三层拼接后写入 CLIP(顺序见下方,可拖动)</span>
+              <span>三层拼接后写入正向提示词(顺序见下方,可拖动)</span>
             </label>
             <p class="wf-layer-hint">
-              关掉 = 旧口径:只发「固定正面 + 剧情」,角色提示词不进 CLIP。
-              开启后角色层的来源是「角色管理」页的固定外貌库 + 当楼临时提示词。
+              关掉 = 旧口径:只发「固定正面 + 剧情」,角色提示词不参与拼接。
+              开启后角色层的来源是「角色档案」页:本聊天角色档案里、本次认得出在场的角色,实时取词(固定外貌 + AI 按剧情更新的临时穿戴)。
+              简易模式拼进 CLIP,自定义模式拼进 %prompt% —— 两种模式同一套层序与去重。
             </p>
 
             <ol class="wf-layer-order" :class="{ 'is-off': !active.simple.layered }">
@@ -883,56 +1109,19 @@ function applyAssist() {
             </div>
             <PromptSendPreview
               :config="active.simple"
-              mode="simple"
+              :mode="active.mode === 'custom' ? 'custom' : 'simple'"
               :fixed="active.simple.positive"
               story="1girl, standing in the rain(出图时由 AI 按本楼正文编译)"
+              story-is-example
               :negative-builtin="active.simple.negative"
               :negative-dynamic="'rain, umbrella(示例:AI 本图排除词,每张不同)'"
-              :negative-supported="meta.supportsNegative"
+              :negative-supported="negativeReachesWorkflow"
               compact
             />
             <p class="wf-layer-hint">
-              剧情层这里是示例串;想看真实一楼的完整三层,到「发送预览」页用草稿试。
+              剧情层这里是示例串(角色层仍按最近一次编译的正文实时取词);想看真实一楼的完整三层,到「发送预览」页用草稿试。
             </p>
           </section>
-
-        </template>
-
-        <!-- 自定义模式:粘贴 API 格式 JSON -->
-        <template v-else>
-        <div class="wf-json-head">
-          <span class="bbi-field-label">工作流 JSON</span>
-          <span class="wf-json-tools">
-            <span
-              class="bbi-prompt-state wf-state"
-              :class="`is-${workflowState.tone}`"
-              :title="workflowState.detail || undefined"
-            >
-              {{ workflowState.text }}
-            </span>
-            <button
-              class="bbi-btn bbi-btn-primary bbi-btn-sm"
-              type="button"
-              :disabled="configuring || !active.workflow.trim()"
-              title="AI 判断节点用途并自动配置占位符；工作流节点、模型名和本地路径会发送给设置页「生成 tag 使用」的 API"
-              @click="onAutoConfigure"
-            >
-              <Icon name="sparkles" :size="12" />
-              {{ configuring ? '分析中…' : 'AI 自动配置' }}
-            </button>
-          </span>
-        </div>
-        <BbiTextarea
-          v-model="active.workflow"
-          :rows="8"
-          :max-rows="24"
-          mono
-          placeholder='{"3": {"class_type": "KSampler", ...}, ...}'
-        />
-        <p class="bbi-field-hint wf-hint">
-          「Save (API Format)」导出；可用 %prompt% %negative_prompt% %seed% %nl% %width% %height%
-        </p>
-        </template>
       </Collapsible>
     </div>
 
@@ -1137,6 +1326,91 @@ function applyAssist() {
   gap: 8px;
 }
 /* 提示词组头右侧的分层摘要:常驻一行,窄屏先收缩后换行,不挤掉左边的「提示词」 */
+.wf-char-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.wf-char-empty {
+  padding: 10px 12px;
+  border: 1px dashed var(--bbi-border, #d8d2c6);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: 0.8;
+}
+
+.wf-char-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.wf-char-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--bbi-border, #e2dcd0);
+  border-radius: 8px;
+  background: var(--bbi-surface-2, rgba(0, 0, 0, 0.02));
+}
+
+.wf-char-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.wf-char-pill {
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--bbi-accent-soft, rgba(196, 132, 40, 0.16));
+  color: var(--bbi-accent, #9a6a1c);
+}
+
+.wf-char-pill.is-muted {
+  background: rgba(120, 120, 120, 0.14);
+  color: inherit;
+  opacity: 0.8;
+}
+
+.wf-char-profile {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  word-break: break-word;
+  opacity: 0.85;
+}
+
+.wf-char-transient {
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.75;
+}
+
+.wf-char-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wf-char-effective {
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.85;
+  word-break: break-word;
+}
+
 .wf-layer-summary {
   font-size: 11.5px;
   color: var(--bbi-ink-soft);

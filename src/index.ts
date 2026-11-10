@@ -5,6 +5,7 @@ import { bindFloorHydration } from '@/floor/hydrate';
 import { injectMenuButton } from '@/menu';
 import { registerPublicInterface } from '@/public/register';
 import { bindCharTagSync } from '@/state/charTags';
+import { ensureChatProfiles, hydrateChatProfiles, initProfileBook } from '@/state/charProfiles';
 import { bindCharacterPromptSync, hydrateCharacterPrompts } from '@/state/characterPromptStore';
 import { initGlobalCharTags } from '@/state/globalCharTags';
 import { hydrateSettings } from '@/state/settings';
@@ -107,6 +108,11 @@ async function hydrateWhenReady(attempt = 0) {
       // 常驻/临时提示词:先读进内存(角色页与出图都读它),再挂 CHAT_CHANGED 重建
       hydrateCharacterPrompts();
       bindCharacterPromptSync();
+      // 角色档案:先领养跨聊天的档案库(extensionSettings),再读本聊天档案(chatMetadata)。
+      // 顺序反了的话,首次 seed 会拿空档案库跑一遍,关键词一个都命中不了。
+      initProfileBook();
+      hydrateChatProfiles();
+      ensureChatProfiles();
       ensureImageTagRegexRegistered();
       bindAutoTagging();
       bindFloorHydration();

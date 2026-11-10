@@ -1,9 +1,9 @@
 {
   "name": "st-yg-image",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
-  "description": "YG 插图师：SillyTavern 剧情配图扩展。提示词可由内置 LLM 分析，也可交给中转站模型编译成 CLIP 提示词",
+  "description": "YG 插图师：SillyTavern 剧情配图扩展。一次 AI 调用完成选画面、写 tag、维护角色档案并编译成英文提示词，三层合成后写进 ComfyUI 的 %prompt%",
   "license": "MIT",
   "scripts": {
     "sync-version": "node scripts/sync-version.mjs",

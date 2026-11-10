@@ -279,12 +279,18 @@ export function validateSimpleConfig(simple: ComfySimpleConfig): string | null {
 
 /** 组装入参:与占位符体系同源,只是不走宏替换。 */
 export interface SimpleGenValues {
-  /** AI 生成的正向 tag。 */
+  /** AI 生成的正向 tag(剧情层)。 */
   prompt: string;
   /** AI 生成的自然语言(预设开启「生成自然语言」时才有);简易模式下优先于 tag。 */
   nl?: string;
   /** AI 生成的动态负面 tag。 */
   negative?: string;
+  /**
+   * **固定正面**。custom 模式(自定义工作流)下没有 simple.positive 可读,
+   * 用户把质量词/画风词写在渠道配置的「正面质量词」里,由 generate.ts 传进来。
+   * 简易模式下留空即可 —— 固定正面一律取 simple.positive,两者不会同时生效。
+   */
+  fixed?: string;
   /**
    * 本张画面的多角色提示。NAI 4.5/V5 走原生 character prompts;
    * 分层开启时,ComfyUI 走「角色层」拼进正向提示词(见 promptLayers.ts)。
@@ -295,6 +301,8 @@ export interface SimpleGenValues {
    * 分层开启时并入角色层;关掉分层时**不进 CLIP**(与 0.5.0 旧口径一致)。
    */
   characterTag?: string;
+  /** 分层拼接选项;custom 模式没有 ComfySimpleConfig,只能从这里拿(见 customLayerOptions)。 */
+  layerOptions?: PromptLayerOptions;
   seed: number;
   width: number;
   height: number;
@@ -315,6 +323,22 @@ export function layerOptionsOf(simple: ComfySimpleConfig): PromptLayerOptions {
     dedupe: simple.dedupeTags !== false,
     budget: simple.tagBudget,
     order: normalizeLayerOrder(simple.layerOrder),
+  };
+}
+
+/**
+ * custom 模式的工作流里只有 %prompt% 一个入口,没有「角色位」。
+ * 于是三层在这里也走同一份拼接实现:固定正面(渠道正面质量词)→ 角色(常驻+临时档案)
+ * → 剧情(AI 编译出的 tag),合成一串再塞进 %prompt%。
+ *
+ * 关掉分层时退回旧口径(直线拼接,不去重不排序),给「我要原样对比」留后路。
+ */
+export function customLayerOptions(layered: boolean, separator?: string): PromptLayerOptions {
+  return {
+    separator: (separator ?? '').trim() || DEFAULT_SEPARATOR,
+    dedupe: true,
+    budget: 0,
+    order: LAYER_ORDER,
   };
 }
 
@@ -340,6 +364,58 @@ export function composePositive(simple: ComfySimpleConfig, values: SimpleGenValu
       storyNl: values.nl,
     },
     layerOptionsOf(simple),
+  );
+}
+
+/**
+ * custom 模式(自定义工作流)的正向提示词:三层合成后整串交给 %prompt%。
+ *
+ * 这是「把画面编译成一串英文提示词」的最后一步 —— 固定正面(渠道正面质量词)、
+ * 角色常驻/临时档案、AI 编译出的画面词在这里合成一串,再由 generateComfyImage
+ * 写进工作流的 %prompt% 占位符。layered 为 false 时退回直线拼接。
+ */
+export function composeCustomPositive(
+  values: SimpleGenValues,
+  layered: boolean,
+  separator?: string,
+): string {
+  const fixed = String(values.fixed ?? '').trim();
+  if (!layered) {
+    return joinParts(fixed, values.characterTag, (values.nl ?? '').trim() || values.prompt);
+  }
+  return composeLayeredPrompt(
+    {
+      fixed,
+      characters: values.characters,
+      characterTag: values.characterTag,
+      story: values.prompt,
+      storyNl: values.nl,
+    },
+    values.layerOptions ?? customLayerOptions(layered, separator),
+  );
+}
+
+/**
+ * custom 模式的负面:**固定负面 + 本图排除**。
+ *
+ * 与简易模式同一个 buildNegativeLayers,区别只在来源(简易模式读 ComfySimpleConfig,
+ * 这里由调用方把渠道里那格固定负面传进来)。
+ * 为什么不复用 composeNegative:它要一整份 ComfySimpleConfig,而 custom 模式的工作流
+ * 未必有 simple 那套字段;只取 negative 这一个标量,接口更诚实。
+ *
+ * 分层关闭时退回直线拼接(固定负面在前,AI 动态词在后),与正向的旧口径对称。
+ */
+export function composeCustomNegative(
+  values: { negative?: string; fixed?: string },
+  layered: boolean,
+  separator?: string,
+): string {
+  const fixed = String(values.fixed ?? '').trim();
+  const dynamic = String(values.negative ?? '').trim();
+  if (!layered) return joinParts(fixed, dynamic);
+  return composeNegativeLayers(
+    { builtin: fixed, dynamic },
+    { separator: (separator ?? '').trim() || DEFAULT_SEPARATOR, dedupe: true, budget: 0 },
   );
 }
 

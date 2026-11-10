@@ -9,6 +9,7 @@ import {
   type TransientPromptEntry,
   type TransientPromptState,
 } from '@/autoTag/characterPrompts';
+import { composeProfilesForPresent } from '@/state/charProfiles';
 import { getContext } from '@/st/context';
 import {
   normalizeCharacterPromptSettings,
@@ -220,6 +221,62 @@ export function transientsAtFloor(floor: number): TransientPromptEntry[] {
 /** 某条是否已过期(UI 标灰用)。 */
 export function isEntryStale(entry: TransientPromptEntry, floor: number): boolean {
   return isTransientStale(entry.floor, floor);
+}
+
+/* ============ 本聊天角色档案(给渠道页的可见列表) ============ */
+
+/**
+ * 本聊天角色档案的可编辑视图:每行一个角色,同时给出「档案里的固定外貌」与「用户手写的追加词」。
+ *
+ * 为什么要这一层:`byChar` 只存用户手写的那段,档案给的固定外貌并不在里面
+ * (那是 charProfiles 的事)。渠道页要让用户看见「这个角色进角色层时到底发出什么」,
+ * 所以把两份拼成一行只读的 `effective`,再单独把可写的那格 `override` 交回给界面。
+ * 合成走 composeCharacterPrompts,与出图同一份实现 —— 预览与实发不允许有两套口径。
+ */
+export interface CharacterPromptRow {
+  /** 角色名(与档案同名)。 */
+  name: string;
+  /** 档案给的固定外貌串(只读;空 = 还没建档或档案没词)。 */
+  profile: string;
+  /** 用户手写的追加/覆盖词(可写,存 byChar)。 */
+  override: string;
+  /** 此刻的临时穿戴(AI 写,只读)。 */
+  transient: string;
+  /** 临时词是否被冻结(AI 不再改写)。 */
+  frozen: boolean;
+  /** 这一行最终进角色层的串(档案 + 手写 + 穿戴,已去重)。 */
+  effective: string;
+}
+
+export function listCharacterPromptRows(): CharacterPromptRow[] {
+  const names: string[] = [];
+  const push = (name: string | undefined | null) => {
+    const key = String(name ?? '').trim();
+    if (key && !names.includes(key)) names.push(key);
+  };
+  for (const name of Object.keys(basePrompt.byChar)) push(name);
+  for (const entry of temporaryPrompt.entries) push(entry.name);
+  return names.map(name => {
+    const profile = composeProfilesForPresent([name]);
+    const override = String(basePrompt.byChar[name] ?? '').trim();
+    const entry = temporaryPrompt.entries.find(item => item.name === name);
+    const transient = entry ? entry.prompt.trim() : '';
+    const merged = composeCharacterPrompts({
+      entries: [],
+      base: { enabled: basePrompt.enabled, general: '', byChar: { [name]: override } },
+      transient: { enabled: temporaryPrompt.enabled, entries: entry ? [entry] : [] },
+      present: [name],
+      generalOnly: false,
+    }).text;
+    return {
+      name,
+      profile,
+      override,
+      transient,
+      frozen: entry?.frozen === true,
+      effective: merged,
+    };
+  });
 }
 
 /* ============ 出图取用 ============ */

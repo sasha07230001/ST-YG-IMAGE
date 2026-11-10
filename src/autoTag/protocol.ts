@@ -1,5 +1,6 @@
 import { normalizeOrientation, type Orientation } from '@/backends/size';
 import type { TargetSegment } from '@/autoTag/clean';
+import { parseTransientReply } from '@/autoTag/characterPrompts';
 import { FORBIDDEN_SUBTAG, serializeImageTag } from '@/st/imageTagRegex';
 import {
   CHAR_TAG_FIELDS,
@@ -29,10 +30,42 @@ export interface ImageInsertion {
   size: Orientation;
 }
 
+/**
+ * 一次调用里的「此刻穿戴/状态」记录(临时提示词)。
+ *
+ * 为什么要与 images/changes 挤在同一份 JSON 里:`runner` 原本为它单发一次请求,
+ * 那一跳看得见正文却看不见本次选了哪个瞬间,写回来的服装常常是另一句话里的;
+ * 更要命的是那一跳说「不写发色瞳色」、主请求说「照抄库里字段」,两份口径各自
+ * 自洽却互相打架。合并进同一次输出后,模型是**看着自己刚选的画面**写这套衣服的。
+ *
+ * 边界必须写死在协议里(见 prompt.ts 的 transientRule):这里是**本楼此刻**的穿戴,
+ * 固定外貌只能进 changes 的建档字段,二者不许互串 —— 那正是当初拆两次请求想解决的问题。
+ */
+export interface TransientStateEntry {
+  /** 角色名,必须与角色固定外貌库中的名字逐字一致。 */
+  name: string;
+  /** 此刻穿戴/状态的英文 danbooru 短 tag 串;空串 = 这一楼已不需要覆盖(回落到固定档案)。 */
+  prompt: string;
+  /** 明确要求清空(正文写了他换回原本穿着)。 */
+  cleared: boolean;
+}
+
+/** 落库前的形态:runner 用它写 characterPromptStore,与 parseTransientReply 输出同形。 */
+export interface TransientPromptUpdate {
+  name: string;
+  prompt: string;
+  cleared: boolean;
+}
+
 export interface ImagePlan {
   images: ImageInsertion[];
   /** AI 报告的角色库变更(建档/字段更新);调用方负责落库。 */
   changes: CharChange[];
+  /**
+   * 本楼此刻的角色穿戴/状态(可空)。输出格式与旧「临时提示词」那一跳完全兼容
+   * ({角色名: tag 串} 或 [{name,prompt}]),所以同一份解析器 parseTransientReply 仍在用。
+   */
+  transient: TransientPromptUpdate[];
 }
 
 /** AI 输出的单条角色变更(宽松形状;解析后字段全部合法才保留)。 */
@@ -165,6 +198,23 @@ function sanitizePosition(value: unknown, index: number): string {
 }
 
 /**
+ * 把一段 JSON 值(协议里的 transient 键)读成临时状态条目。
+ *
+ * 单独抽出来是因为 protocol 是**唯一解析入口**,而 transient 的形状比 images 宽:
+ * 模型可能给 {"小雪":"white dress"}、也可能给 [{"name":"小雪","prompt":"white dress"}]。
+ * 解析器复用 characterPrompts.parseTransientReply(它本来就吃这两种形状);
+ * 这里只负责把 JSON 值重新序列化过去,并保证任何异常都退化成空数组。
+ */
+function parseTransientValue(value: unknown): TransientPromptUpdate[] {
+  if (value === undefined || value === null) return [];
+  try {
+    return parseTransientReply(JSON.stringify(value), []);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * 解析并严格校验模型给出的“目标位置 ID + 提示词”列表。tag 必填;nl/negative 选填。
  * size 一律容忍:归一不出就当竖屏——为它抛错会白白吃掉 runner 的重试次数。
  * 图片超过上限时本地硬截断;少于用户明确设置的下限则抛错,交给 runner 重试。
@@ -172,8 +222,8 @@ function sanitizePosition(value: unknown, index: number): string {
  * 没锚定,为它作废整次输出会连图一起没有,那是更坏的结果。
  *
  * `lenientPosition`:主模型给出的位置 ID 不在目标正文里(算错了位置编号、或照着上下文
- * 的旧编号写)时,回落到第一个位置而不是整次作废。中转站那条链刻意打开它——
- * 那个模型只看得到这一段正文,它给的最重要产出是**提示词**,位置只是附属信息;
+ * 的旧编号写)时,回落到第一个位置而不是整次作废。中转站/纯编译模型刻意打开它——
+ * 那个模型看到的重点产出是**提示词**,位置只是附属信息;
  * 为了一个编号把整次编译结果扔掉、再烧一次请求,代价明显不值。
  */
 export function parseImagePlan(
@@ -182,8 +232,7 @@ export function parseImagePlan(
   minImages: number,
   maxImages: number,
   options: { lenientPosition?: boolean } = {},
-): ImagePlan {
-  const parsed = parseObject(raw);
+): ImagePlan {  const parsed = parseObject(raw);
   if (!Array.isArray(parsed.images)) throw new Error('AI 返回的 JSON 缺少 images 数组');
   const normalizedMax = Math.max(1, Math.floor(Number(maxImages)) || 1);
   const normalizedMin = Math.min(
@@ -235,6 +284,13 @@ export function parseImagePlan(
   return {
     images: limitedImages,
     changes: parseChanges(parsed.changes, positions),
+    /**
+     * 临时状态:宽容到极致 —— 它只是「这张图多几个穿戴词」,一条坏数据绝不许
+     * 连累已经选好的画面。解析失败一律当空数组(与旧链路单独一跳时的纪律一致)。
+     * 已知角色清单这里拿不到(取决于角色库),故传空数组;名字合法性留给
+     * runner 落库那一步按库里现有名字判(与 setTransientForChar 的冻结规则同一处)。
+     */
+    transient: parseTransientValue(parsed.transient ?? parsed.transientState),
   };
 }
 

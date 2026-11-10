@@ -12,6 +12,7 @@ import {
   type ChatBasePrompt,
   type TransientPromptState,
 } from '@/autoTag/characterPrompts';
+import { pickPresentNames } from '@/autoTag/characterPrompts';
 import { normalizeCharacterPromptSettings } from '@/state/settings';
 
 /**
@@ -278,5 +279,37 @@ describe('设置层:常驻/临时存储清洗', () => {
 describe('mergeTagText', () => {
   it('去空、按小写去重、保持首次出现的顺序', () => {
     expect(mergeTagText('a, b', undefined, ' B , c ', 'a')).toBe('a, b, c');
+  });
+});
+
+describe('pickPresentNames:角色层取词的白名单', () => {
+  it('提示词里点到的名字才算在场', () => {
+    expect(pickPresentNames(['小雪', '阿岚'], '1girl, silver hair, 小雪站在雨里')).toEqual(['小雪']);
+  });
+
+  it('结构化角色名一律算在场', () => {
+    expect(pickPresentNames(['小雪'], '1girl, standing')).toEqual([]);
+    expect(pickPresentNames(['小雪'], '1girl, standing, 小雪')).toEqual(['小雪']);
+  });
+
+  it('英文 tag 名按词边界匹配,不被子串命中', () => {
+    expect(pickPresentNames(['rin'], '1girl, grinning, outdoors')).toEqual([]);
+    expect(pickPresentNames(['rin'], '2girls, rin, standing')).toEqual(['rin']);
+  });
+
+  it('长名优先,短名不吃掉长名的档案', () => {
+    expect(pickPresentNames(['小雪', '小雪乃'], '小雪乃在窗边')).toEqual(['小雪乃']);
+    expect(pickPresentNames(['小雪', '小雪乃'], '小雪乃和小雪')).toEqual(['小雪', '小雪乃']);
+  });
+
+  it('一个都没认出或提示词为空时返回空数组', () => {
+    expect(pickPresentNames(['小雪'], '1girl, standing')).toEqual([]);
+    expect(pickPresentNames(['小雪'], '')).toEqual([]);
+    expect(pickPresentNames([], '小雪')).toEqual([]);
+    expect(pickPresentNames([null, '  '], '小雪')).toEqual([]);
+  });
+
+  it('结果保持候选原顺序,不随长度排序漂移', () => {
+    expect(pickPresentNames(['阿岚', '小雪乃'], '小雪乃与阿岚')).toEqual(['阿岚', '小雪乃']);
   });
 });

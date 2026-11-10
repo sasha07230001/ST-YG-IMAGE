@@ -1,9 +1,8 @@
 import type { Component } from 'vue';
 import Backend from './backend/index.vue';
-import Characters from './characters/index.vue';
+import Profiles from './profiles/index.vue';
 import Gallery from './gallery/index.vue';
 import History from './history/index.vue';
-import Preview from './preview/index.vue';
 import Relay from './relay/index.vue';
 import Settings from './settings/index.vue';
 
@@ -23,14 +22,16 @@ export interface PageDef {
  * 与渠道页并列才好找——原版把这段散在设置页,用户得翻两层才看见自己在用哪条链。
  *
  * 「发送预览」再往后:它不产生配置,只负责回答「这一串最后长什么样」,
- * 所以位置在管来源的「提示词」之后、管角色的「角色管理」之前——顺着读就是
+ * 所以位置在管来源的「提示词」之后、管角色的「角色档案」之前——顺着读就是
  * 提示词从哪来 → 拼成什么样 → 谁在里面。
+ *
+ * 「角色档案」取代了旧的「角色管理」:档案库(用户手写模板 + 触发关键词) 与
+ * 本聊天角色档案(AI 按剧情更新)分两层,角色层的词实时从后者取。
  */
 export const PAGES: PageDef[] = [
   { id: 'backend', label: '渠道', component: Backend },
   { id: 'relay', label: '提示词', component: Relay },
-  { id: 'preview', label: '发送预览', component: Preview },
-  { id: 'characters', label: '角色管理', component: Characters },
+  { id: 'profiles', label: '角色档案', component: Profiles },
   { id: 'gallery', label: '图库', component: Gallery },
   { id: 'history', label: '请求历史', component: History },
   { id: 'settings', label: '设置', component: Settings },

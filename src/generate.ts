@@ -23,15 +23,17 @@
  */
 
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
-import { comfySimpleParams, composeNegative, composePositive, validateSimpleConfig, type SimpleGenValues } from '@/backends/comfyTemplates';
+import { comfySimpleParams, composeCustomNegative, composeCustomPositive, composeNegative, composePositive, validateSimpleConfig, type SimpleGenValues } from '@/backends/comfyTemplates';
 import { generateComfyImage, randomSeed, type ComfyImageResult } from '@/backends/comfyui';
 import { generateNaiImage, naiRandomSeed, naiSupportsCharacterPrompts } from '@/backends/nai';
 import { effectiveOrientation, parseSize, pickSize, type Orientation } from '@/backends/size';
 import { acquireNaiSlot } from '@/floor/genQueue';
 import type { GenerationMeta } from '@/generationMeta';
+import { chatProfiles, findProfile, profileEntryTag } from '@/state/charProfiles';
 import { activeComfyPreset, activeNaiEndpoint, activeOrientationLock, effectiveComfyConn, effectiveNai, settings, type BackendId } from '@/state/settings';
 import { resolveCharacterPrompts } from '@/state/characterPromptStore';
-import { appendCharacterPrompts } from '@/autoTag/characterPrompts';
+import { appendCharacterPrompts, pickPresentNames } from '@/autoTag/characterPrompts';
+import { composeProfilesForPresent, resolvePresentProfiles } from '@/state/charProfiles';
 
 /** 一次生成的输入。与协议层 ImageInsertion 同形,但不含正文位置信息。 */
 export interface GenerateInput {
@@ -231,19 +233,97 @@ export async function generateImage(
    * 于是退化为「只取通用常驻词 + 无法判定在场者时不带角色级内容」——
    * 宁可少带,也不能把不在场角色的穿着写进这张图(那是凭空多一个人的头号成因)。
    */
-  const present = characters.map(character => character.name).filter(Boolean);
-  const archive =
+  /**
+   * 角色档案的**候选名单**(还没判定谁在场):通用常驻词与全部建档角色的名字。
+   * 真正的在场判定在下面 present 那一段 —— 候选名单只用来知道「库里有哪些人」。
+   */
+  const candidates =
     characterPrompts.enabled === false
       ? { text: '', names: [] as string[] }
       : resolveCharacterPrompts({
           floor: characterPrompts.floor,
-          present,
+          present: characters.map(character => character.name).filter(Boolean),
           generalOnly: characterPrompts.generalOnly === true,
           // 楼层卡片走默认的 reload:用户可能刚在角色页改过常驻词
           reload: characterPrompts.reload !== false,
         });
-  const prompt = appendCharacterPrompts(input.prompt, archive.text);
   const nl = input.nl ?? '';
+  /**
+   * custom 模式(自定义工作流)唯一的提示词入口就是 %prompt%:固定正面(当前工作流的
+   * simple.positive 那一格,自定义模式也照填不误)、角色常驻/临时档案、AI 编译出的
+   * 画面词必须**在这里**先合成一串再交给工作流,否则角色层与画风词会整段消失。
+   *
+   * 简易模式不在这里合成:它有自己的 simple.positive 与分层开关,由
+   * composePositive 在后端组装阶段拼接(同一个 buildPromptLayers 实现,口径一致)。
+   */
+  /**
+   * 固定正面 / 固定负面。
+   *
+   * **两种模式共用同一格**：「渠道」页那套工作流的「提示词」框就是用户的基线词,
+   * 简易模式拼进 CLIP,custom 模式拼进 %prompt% / %negative_prompt%。
+   * 以前 custom 模式的固定负面整段发不出去(只发 AI 的本图排除词),用户填了没反应,
+   * 所以这里改成:custom 也走同一个 simple.negative,与 AI 动态负面分层合并。
+   */
+  const customPreset = activeComfyPreset();
+  const customLayered = customPreset.mode === 'custom' && customPreset.simple.layered !== false;
+  // 固定正面:两种模式都取「渠道」页当前工作流的「正面提示词」那一格;留空就不硬塞任何画风词。
+  const fixedPositive = String(customPreset.simple.positive ?? '').trim();
+  // 固定负面同理:简易模式交给 composeNegative,custom 模式由 composeCustomNegative 拼。
+  const fixedNegative = customPreset.simple.negative ?? '';
+
+  /**
+   * **本次真正在场的角色名** —— 角色层取词的白名单。
+   *
+   * ComfyUI 这条链从不传 characters[](那是 NAI 4.5/V5 的结构化多角色字段),
+   * 于是 resolveCharacterPrompts 拿到的 present 恒为空数组,它只能给出「通用常驻词」。
+   * 这就是用户看到的「角色提示词没被注入」:不是拼接层坏了,是上游根本没告诉它画的是谁。
+   *
+   * 判据只用**本图自己的提示词**(AI 刚按这一瞬间写的 tag + nl + 结构化角色名):
+   *   - 名字出现在本图 tag/nl 里,或被 AI 写进 changes(说明这一楼它出场了),就算在场;
+   *   - 名字是库里另一个名字的前缀时不算(「小雪」不该把「小雪乃」的档案拖进来);
+   *   - 宁可少带也不多带:拖进没出场的人,比少一个穿搭配件更能毁掉这张图。
+   */
+  /**
+   * 角色层的取词口径在 0.7 换代了:**本聊天角色档案**,不再走旧的「常驻/临时」两张表。
+   *
+   * 为什么改:旧表只按名字取词,而 ComfyUI 那条链从不传 characters[],于是 present
+   * 恒空 → 只能发通用常驻词 → 用户看到的「角色提示词没被注入」。新结构里
+   * 「谁在场」由关键词命中 + 本图 tag 里出现的名字决定(见 resolvePresentProfiles),
+   * 「她长什么样」由本聊天档案提供(AI 每楼按剧情就地更新)。
+   */
+  const presentNames =
+    characterPrompts.enabled === false
+      ? []
+      : resolvePresentProfiles({
+          candidates: [...characters.map(character => character.name), ...candidates.names],
+          prompt: [input.prompt, input.nl ?? ''].join(' '),
+        });
+  /** 本次在场的角色档案串;同时保留旧常驻/临时表里可能残留的通用词。 */
+  const profileText = presentNames.length ? composeProfilesForPresent(presentNames) : '';
+  /**
+   * 档案库兜底:在场者只存在于用户手写的档案库、本聊天还没播种时(正文没提到他,
+   * 但 NAI 的 characters[] 或 AI 的 tag 里点了名),照档案库初始外貌发一次。
+   * 本聊天档案永远优先 —— 它记的是这一场戏里她现在的样子。
+   */
+  const bookText = presentNames
+    .filter(name => {
+      const entry = chatProfiles.entries.find(item => item.name.toLowerCase() === name.toLowerCase());
+      return !entry || !profileEntryTag(entry);
+    })
+    .map(name => {
+      const book = findProfile(name);
+      return book ? profileEntryTag(book) : '';
+    })
+    .filter(text => String(text ?? '').trim())
+    .join(', ');
+  const presentArchive = {
+    text: [candidates.text, profileText, bookText]
+      .filter(part => String(part ?? '').trim())
+      .join(', '),
+    names: presentNames,
+  };
+  /** 最终进提示词的角色层:在场者的常驻 + 临时词,接在剧情 tag 之后。 */
+  const prompt = appendCharacterPrompts(input.prompt, presentArchive.text);
 
   let release: (() => void) | null = null;
   try {
@@ -254,6 +334,13 @@ export async function generateImage(
     // 画幅锁在这里统一生效(卡片与公开接口同走本函数):只决定这一次用哪格尺寸,
     // tag 里记的方向原样不动——promptHash 吃 tag 原文,改写会让老图无辜变 stale。
     const size = effectiveOrientation(activeOrientationLock(), input.size ?? 'portrait');
+    /**
+     * 这一次实际用的像素。必须**在发请求之前**算出来并显式传给两个后端:
+     * 以前只在请求后算一次给 meta 记档用,custom 模式的值全落到 0 —— 工作流里的
+     * %width%/%height% 于是被替换成 0/None,ComfyUI 直接 400
+     * (invalid_input_type: Failed to convert an input value to a INT value)。
+     */
+    const pixels = parseSize(pickSize(comfyConn ?? effectiveComfyConn(), size));
     let result: ComfyImageResult;
     let meta: GenerationMeta;
     if (isNai) {
@@ -269,32 +356,63 @@ export async function generateImage(
       meta = { backend: 'nai', model: status.model, ...output.usage };
     } else {
       const conn = comfyConn ?? effectiveComfyConn();
+      // custom 模式:三层在这里合成成最终那一串 %prompt%。简易模式保持原样,交给后端。
+      const customPrompt =
+        conn.mode === 'custom'
+          ? composeCustomPositive(
+              {
+                prompt,
+                nl,
+                fixed: fixedPositive,
+                characters,
+                characterTag: presentArchive.text,
+                seed: input.seed,
+                width: pixels?.width ?? 0,
+                height: pixels?.height ?? 0,
+              },
+              customLayered,
+            )
+          : prompt;
+      /**
+       * 负面:**custom 模式也得把固定负面带上**。
+       *
+       * 以前这里直接 `negative_prompt: input.negative`,也就是只发 AI 给这张图编的
+       * 「本图排除词」,用户在「提示词」框里写的通用负面(lowres / bad anatomy …)
+       * 整段发不出去,%negative_prompt% 只拿到半份,负面当然没效果。
+       */
+      const customNegative =
+        conn.mode === 'custom'
+          ? composeCustomNegative({ negative: input.negative, fixed: fixedNegative }, customLayered)
+          : (input.negative ?? '');
       result = await generateComfyImage(
         conn,
         {
-          prompt,
+          prompt: customPrompt,
           nl,
-          negative_prompt: input.negative ?? '',
+          negative_prompt: customNegative,
           seed: input.seed,
           size,
+          // 显式交出像素:自定义工作流里的 %width%/%height% 全靠它,
+          // 留空会让占位符被替换成 0,ComfyUI 的 EmptyLatentImage 立刻 400
+          width: pixels?.width ?? 0,
+          height: pixels?.height ?? 0,
           // 只有分层开启时才把角色层交给后端;关掉就回到 0.5.0 旧口径(角色不进 CLIP)
           characters: comfyLayered ? characters : undefined,
-          characterTag: comfyLayered ? archive.text : undefined,
+          characterTag: comfyLayered ? presentArchive.text : undefined,
         },
         signal,
         { onQueue: ahead => progress.onQueue?.(ahead) },
       );
       // ComfyUI 没有运行期跳过的概念，配方全在预设里，可在此直接快照。
       // 尺寸解析口径与 generateComfyImage 一致（未解析出时 0 = 用工作流自带尺寸）。
-      const px = parseSize(pickSize(conn, size));
-      const width = px?.width ?? 0;
-      const height = px?.height ?? 0;
+      const width = pixels?.width ?? 0;
+      const height = pixels?.height ?? 0;
       const simpleValues: SimpleGenValues = {
         prompt,
         nl,
         negative: input.negative,
         characters: comfyLayered ? characters : undefined,
-        characterTag: comfyLayered ? archive.text : undefined,
+        characterTag: comfyLayered ? presentArchive.text : undefined,
         seed: input.seed,
         width,
         height,
@@ -304,9 +422,9 @@ export async function generateImage(
         model: status.model,
         width,
         height,
-        // custom 模式的提示词由工作流里的占位符决定，无法在这里拼出全文，留空。
-        positive: conn.mode === 'simple' ? composePositive(conn.simple, simpleValues) : '',
-        negative: conn.mode === 'simple' ? composeNegative(conn.simple, simpleValues) : '',
+        // custom 模式记下实际塞进 %prompt% / %negative_prompt% 的那两串
+        positive: conn.mode === 'simple' ? composePositive(conn.simple, simpleValues) : customPrompt,
+        negative: conn.mode === 'simple' ? composeNegative(conn.simple, simpleValues) : customNegative,
         artist: null,
         vibes: [],
         params: conn.mode === 'simple' ? comfySimpleParams(conn.simple) : { mode: 'custom' },
@@ -323,7 +441,7 @@ export async function generateImage(
       charactersApplied,
       meta,
       // 这次实际追加的角色档案串(灯箱与图库要能回溯「这张图为什么多了这几个词」)
-      characterPrompt: archive.text,
+      characterPrompt: presentArchive.text,
     };
   } finally {
     release?.();

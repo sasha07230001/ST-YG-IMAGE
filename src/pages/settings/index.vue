@@ -204,18 +204,14 @@ function isTagPromptCustom(key: keyof AutoTagPrompts): boolean {
 }
 
 /**
- * 按「提示词方式」过滤要显示的条目。
+ * 要显示的提示词条目。
  *
- * 破限词两套都用(置顶 system 降低拒答率,中转站那条链也吃它),
- * 规范与思维链则各自属于一条链:把 NAI 的 Base+Character 规范列在中转站模式下,
- * 用户改了也不会生效——比不列出来更容易误判「改了没用」。
+ * 0.7 起「提示词方式」只决定这次请求发给哪台模型,契约与规范是同一份:
+ * 改 NAI 的 Base+Character 规范,切到中转站照样生效;反过来,填了「编译身份」
+ * 而用内置模型时它也照样作为开场身份发出去。既然每条都生效,就不再按模式互相隐藏
+ * ——隐藏反而让人以为「改了没用」。
  */
-const visibleTagPrompts = computed(() => {
-  const relayMode = settings.autoTag.prompts.mode === 'relay';
-  return TAG_PROMPT_METAS.filter(m =>
-    relayMode ? m.key === 'jailbreak' : m.key !== 'relaySystem' && m.key !== 'relaySpec',
-  );
-});
+const visibleTagPrompts = computed(() => TAG_PROMPT_METAS);
 
 /* —— dsh-purge 强制破甲内核(跨链指令权威层,与上面那组单链提示词分开管) ——
    为什么不塞进 TAG_PROMPT_METAS:那个列表每一项都是「一条 system、由某条链读取」,
@@ -294,7 +290,11 @@ function saveTagPrompt() {
   if (!meta) return;
   // 草稿与内置完全一致→存空串(回落内置),避免把模板冗余存进设置、也便于显示「默认」
   const v = tagPromptDraft.value.trim();
-  settings.autoTag.prompts[meta.key] = v === meta.builtin.trim() ? '' : tagPromptDraft.value;
+  // `keyof AutoTagPrompts` 里混着 mode(枚举)与三个 boolean/枚举键,直接下标赋值会被
+  // 推断成交叉类型 never。这五个 meta 的 key 全是 string 字段(TAG_PROMPT_METAS 只登记
+  // 提示词文本),收窄成「字符串字段名」再写,类型与运行时都一致。
+  const prompts = settings.autoTag.prompts as Record<string, unknown>;
+  prompts[meta.key] = v === meta.builtin.trim() ? '' : tagPromptDraft.value;
   closeTagPrompt();
 }
 // 「恢复默认」:把草稿重置回内置模板(保存后即回落内置)
@@ -532,6 +532,32 @@ function addStripTag() {
 function removeStripTag(tag: string) {
   const idx = settings.excludes.customStripTags.indexOf(tag);
   if (idx >= 0) settings.excludes.customStripTags.splice(idx, 1);
+}
+
+/* —— 正文选取标签:只在被这些标签包住的段落里选画面(空 = 整楼都算候选)。
+   与「自定义清洗标签」是两份名单:那边改历史楼层文本,这边只决定这一轮的范围。 —— */
+const targetTagDraft = ref('');
+const targetStripDraft = ref('');
+
+function addTargetTag() {
+  const tag = sanitizeTagName(targetTagDraft.value);
+  targetTagDraft.value = '';
+  if (!tag) return;
+  if (!settings.autoTag.targetTags.includes(tag)) settings.autoTag.targetTags.push(tag);
+}
+function removeTargetTag(tag: string) {
+  const idx = settings.autoTag.targetTags.indexOf(tag);
+  if (idx >= 0) settings.autoTag.targetTags.splice(idx, 1);
+}
+function addTargetStripTag() {
+  const tag = sanitizeTagName(targetStripDraft.value);
+  targetStripDraft.value = '';
+  if (!tag) return;
+  if (!settings.autoTag.targetStripTags.includes(tag)) settings.autoTag.targetStripTags.push(tag);
+}
+function removeTargetStripTag(tag: string) {
+  const idx = settings.autoTag.targetStripTags.indexOf(tag);
+  if (idx >= 0) settings.autoTag.targetStripTags.splice(idx, 1);
 }
 
 /* —— 模型可搜索下拉(combobox):输入框既是当前值也是过滤词,聚焦弹出过滤列表 —— */
@@ -825,6 +851,68 @@ async function confirmUpdate() {
         <p class="bbi-field-hint">副 API 请求失败或返回无法解析时自动重试；0 = 不重试，最多 5 次。</p>
       </Collapsible>
 
+      <Collapsible title="正文选取标签" :open="false">
+        <p class="bbi-field-hint">
+          决定 AI 从正文的<strong>哪几段</strong>里挑画面。选取名单为空时整楼正文都算候选(默认);
+          填了标签名,就只有被 <code>&lt;标签&gt;…&lt;/标签&gt;</code> 包住的段落能当画面依据,
+          其余正文只作为理解前后文的背景。排除名单里的段落先整块剔掉,再算选取范围。
+        </p>
+
+        <div class="bbi-field-head">
+          <span class="bbi-field-label">只在这些标签里选画面</span>
+          <span class="bbi-count">{{ settings.autoTag.targetTags.length }}</span>
+        </div>
+        <div class="bbi-striptag-bar">
+          <input
+            v-model="targetTagDraft"
+            class="bbi-input"
+            type="text"
+            placeholder="标签名,如 正文 / 场景"
+            @keydown.enter.prevent="addTargetTag"
+          />
+          <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="addTargetTag">
+            <Icon name="plus" /> 添加
+          </button>
+        </div>
+        <ul v-if="settings.autoTag.targetTags.length" class="bbi-exclude-chips">
+          <li v-for="tag in settings.autoTag.targetTags" :key="tag" class="bbi-exclude-chip">
+            <span class="bbi-exclude-chip-name">&lt;{{ tag }}&gt;</span>
+            <button class="bbi-exclude-chip-x" type="button" title="移除" @click="removeTargetTag(tag)">
+              <Icon name="close" />
+            </button>
+          </li>
+        </ul>
+        <p v-else class="bbi-field-hint">名单为空,整楼正文都能选画面。</p>
+
+        <hr class="bbi-rule" />
+
+        <div class="bbi-field-head">
+          <span class="bbi-field-label">这些标签里的内容不要进画面</span>
+          <span class="bbi-count">{{ settings.autoTag.targetStripTags.length }}</span>
+        </div>
+        <div class="bbi-striptag-bar">
+          <input
+            v-model="targetStripDraft"
+            class="bbi-input"
+            type="text"
+            placeholder="标签名,如 状态面板 / 旁注"
+            @keydown.enter.prevent="addTargetStripTag"
+          />
+          <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="addTargetStripTag">
+            <Icon name="plus" /> 添加
+          </button>
+        </div>
+        <ul v-if="settings.autoTag.targetStripTags.length" class="bbi-exclude-chips">
+          <li v-for="tag in settings.autoTag.targetStripTags" :key="tag" class="bbi-exclude-chip">
+            <span class="bbi-exclude-chip-name">&lt;{{ tag }}&gt;</span>
+            <button class="bbi-exclude-chip-x" type="button" title="移除" @click="removeTargetStripTag(tag)">
+              <Icon name="close" />
+            </button>
+          </li>
+        </ul>
+        <p v-else class="bbi-field-hint">没有排除任何标签。</p>
+      </Collapsible>
+
       <!-- 排除角色:名单与柏宝书共享(见 state/settings.ts 的共享存储),任一端改动自动同步 -->
       <Collapsible title="排除角色" :open="false">
         <p class="bbi-field-hint">名单内角色的聊天里不自动生成生图 tag。名单与柏宝书共享,任一端改动自动同步。</p>
@@ -933,7 +1021,8 @@ async function confirmUpdate() {
       <Collapsible title="自定义提示词" :open="false">
         <p class="bbi-field-hint">
           当前提示词方式:<strong>{{ settings.autoTag.prompts.mode === 'relay' ? '中转站编译' : '内置 LLM 分析' }}</strong>。
-          下面的条目按方式过滤——两套口径的规范/思维链互不通用,同屏列出只会让人改错那一条。
+          这一项只决定「这次请求发给哪台模型」,契约、角色库、建档规则、验收与出图全部同一份,
+          所以下面每一条都可能生效——填了就是这一场的开场身份或书写规范,留空即用内置。
           换方式请到「提示词」页。
         </p>
         <ul class="bbi-prompt-list">
@@ -948,7 +1037,8 @@ async function confirmUpdate() {
           </li>
         </ul>
         <p v-if="settings.autoTag.prompts.mode === 'relay'" class="bbi-field-hint">
-          中转站的 system 提示词与编译规范在「提示词」页里改(那里跟渠道配置放在一起,改完能原地自检)。
+          中转站的渠道参数(地址、Key、模型、温度、最大 token)在「提示词」页改,那里改完能原地自检;
+          上面这两个「编译身份 / 编译规范」是它这一轮的开场文案,与本清单同一份数据,两边都能改。
         </p>
 
         <!-- dsh-purge 强制破甲内核:两条链共用、压在最外层 -->
@@ -977,7 +1067,7 @@ async function confirmUpdate() {
           <p class="bbi-field-hint">
             这一层是<strong>指令权威声明</strong>:告诉模型它是渲染环节而不是内容审查员。压在整条请求最外层——
             破限词、角色卡、世界书、输出协议全部被它包住,所以它比链里任何一段材料优先级都高。
-            内置 LLM 链与中转站链<strong>都吃</strong>,与上面那条「破限词」是两层东西:破限词降拒答率,这一层定身份与职责边界。
+            两条提示词方式<strong>都吃</strong>(协议本来就是同一份),与上面那条「破限词」是两层东西:破限词降拒答率,这一层定身份与职责边界。
           </p>
 
           <div class="bbi-select-row">

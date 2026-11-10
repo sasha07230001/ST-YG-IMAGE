@@ -49,8 +49,11 @@ describe('autoTag/prompt:中转站模式', () => {
     expect(autoTagProfile().mode).toBe('relay');
   });
 
-  it('发的是编译协议:自带位置 ID 清单与画幅提示,不带 changes 建档规则', async () => {
+  // 0.7: 提示词方式只决定「发给哪台模型」,协议只有一份 —— 中转站模式下同样要维护
+  // 角色固定外貌库、同样输出 images/changes/transient,只是额外多一段编译身份说明。
+  it('同一份结构化协议:带 P 位置、带角色库与建档规则,只是不用内置那段开场身份', async () => {
     settings.autoTag.prompts.mode = 'relay';
+    settings.autoTag.prompts.relaySystem = '【中转站编译员】';
     const messages = await buildAutoTagMessages(
       context(),
       1,
@@ -64,10 +67,35 @@ describe('autoTag/prompt:中转站模式', () => {
     const text = messages.map(m => m.content).join('\n');
     expect(text).toContain('P1');
     expect(text).toContain('P2');
-    expect(text).toContain('CLIPTextEncode');
-    // 内置链的那套建档口径不该出现在中转站请求里
-    expect(text).not.toContain('角色固定外貌库');
-    expect(text).not.toContain('field:"new"');
+    // 协议与内置链逐字相同:角色库、建档、位置规则都在
+    expect(text).toContain('角色固定外貌库');
+    expect(text).toContain('field:"new"');
+    expect(text).toContain('3. position 必须是');
+    // 编译身份说明压在破限词之后、角色卡之前
+    expect(text.indexOf('【中转站编译员】')).toBeLessThan(text.indexOf('角色固定外貌库'));
+    // 画幅提示追加在目标正文末尾
+    expect(text).toContain('画幅:');
+  });
+
+  it('没填编译身份时,custom 提示词方式与原内置链一字不差', async () => {
+    settings.autoTag.prompts.mode = 'relay';
+    settings.autoTag.prompts.relaySystem = '';
+    const relayMessages = await buildAutoTagMessages(context(), 1, options(), null, undefined, null, '', {
+      naiCharPrompts: false,
+      nl: false,
+      lockedSize: null,
+      mode: 'relay',
+    });
+    const builtinMessages = await buildAutoTagMessages(context(), 1, options(), null, undefined, null, '', {
+      naiCharPrompts: false,
+      nl: false,
+      lockedSize: null,
+      mode: 'builtin',
+    });
+    const relayText = relayMessages.map(m => m.content).join('\n');
+    const builtinText = builtinMessages.map(m => m.content).join('\n');
+    // relay 只多一行画幅提示;除它以外完全一致(证明协议真的没有分叉)
+    expect(relayText.replace(/\n\n画幅:[^\n]*$/, '')).toBe(builtinText);
   });
 
   it('用户自定义 system 覆盖内置,占位符被替换', async () => {

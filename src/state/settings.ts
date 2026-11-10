@@ -501,17 +501,38 @@ export interface AutoTagSettings {
   /** 可编辑提示词集(破限/后端规范/思维链);空串 = 回落内置默认。 */
   prompts: AutoTagPrompts;
   /**
-   * 每轮让模型从剧情读一次「此刻的穿戴/状态」,写进临时提示词。
-   * 会多一次模型调用;关掉后临时提示词只能手填(仍然照常进 CLIP)。
+   * 每轮让模型读一次「此刻的穿戴/状态」,写进临时提示词。
+   *
+   * 自 0.7 起这**不额外花一次调用**:transient 是主请求同一份 JSON 里的一个键,
+   * 模型在选画面时顺便把这个瞬间的穿戴记下来,两份口径不可能打架(旧链路两次请求,
+   * 第二次看不见第一次选的那个瞬间)。关掉它只是让模型不产出这个键,
+   * 手填的临时提示词仍然照常进 CLIP。
    */
   transientAutoRead: boolean;
+  /**
+   * 正文选取标签:只有被这些标签包住的段落才拿来选画面。
+   *
+   * 空名单 = 不限(整楼正文都算候选,旧行为)。填了就只在 <tag>…</tag> 里选:
+   * 适合「正文里既有剧情也有一大段设定/状态面板」的场景 —— 面板本身不该被画成图。
+   * 只影响**选画面的范围**(target 正文与上下文里是否带出这些段),不删内容。
+   */
+  targetTags: string[];
+  /**
+   * 正文排除标签:这些标签包住的段落在选画面之前整块剔掉。
+   *
+   * 与「排除角色 / 排除世界书」同性质,但只管正文;与设置里共享的「自定义清洗标签」
+   * (excludes.customStripTags,柏宝书也在用)是两份独立名单 —— 那边会改变历史楼层的
+   * 文本,这边只影响这一轮选画面。
+   */
+  targetStripTags: string[];
 }
 
 /**
  * 角色档案提示词:常驻(用户手写)与临时(AI 每楼可写)。
  *
- * 两者都**追加到 CLIP 文本末尾**(见 autoTag/characterPrompts.ts 的说明:
- * 恒定画风词已经占了最前面,角色档案是「补充这个人具体长什么样」)。
+ * 两者都**写进正向提示词的角色层**(见 backends/promptLayers.ts 的层序:
+ * 固定正面 → 角色 → 剧情)。层序保证了「这个人长什么样」比剧情 tag 更靠前,
+ * 但又不至于像恒定风格词那样压住画面本身。
  */
 export interface CharacterPromptSettings {
   /** 常驻提示词。按聊天隔离(存 chatMetadata)。 */
@@ -1097,15 +1118,17 @@ Example (小雪 is the principal character and has a library profile; 三年级�
 {{#nl}}{"position":"P2","tag":"2girls, rooftop, sunset, medium shot, foot on hand","nl":"Two girls on a rooftop at sunset, one pinning the other's hand under her foot.","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, source#stepping on","nl":"The girl on the left presses her opponent's hand down with one foot."},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, surprised, looking up, target#stepped on","nl":"The other girl lies on the ground on the right, her hand pinned, staring up in shock."}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"2girls, rooftop, sunset, medium shot, foot on hand","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, source#stepping on"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, surprised, looking up, target#stepped on"}],"size":"landscape"}{{/nl}}`;
 
 /**
- * 提示词生成方式——**本版新增的二分法**,设置页里是一枚分段按钮。
+ * 提示词生成方式 —— 自本版起**只表示「用哪台模型」**,不再是两套协议。
  *
- * - `builtin`:沿用YG原本那条链(独立一次 LLM 请求 → 位置 ID + tag/nl 结构化 JSON
- *   → 写进正文 `<bbi_image>`)。角色固定外貌库、多角色提示、画幅判定全在这里。
- * - `relay`:正文先交给中转站模型编译成一行英文 CLIP 提示词,再按位置 ID 写进正文。
- *   这条链**不产出角色建档**(changes 为空),画面完全由编译出的提示词与恒定词决定。
+ * 0.6.x 及更早:`relay` 是另一条链(正文 → 一行 CLIP 提示词、不建档、不读角色库),
+ * 与 `builtin` 共用前半段而在 `buildAutoTagMessages` 里分叉,两套契约各写一份。
  *
- * 两条链共用后半段:正文注入、楼层卡片、出图、图库、排队/取消逐项同源,
- * 差别只在 autoTag/runner.ts 里「怎么拿到 tag」那一步。
+ * 现在只有**一次调用、一份契约**:选画面、写 tag/nl、维护角色固定外貌库、
+ * 记录本楼此刻的穿戴、把它们编译成能喂 CLIP 的英文提示词,全部在同一次输出里完成。
+ * `builtin`/`relay` 的区别退化为:这次请求发给「主 API / 指派的副 API 渠道」,
+ * 还是发给「中转站页那台专配的模型」。上下文装配、协议、验收、写回、出图逐字相同。
+ *
+ * 键名保留(不改成 provider 之类)是因为它已经存在用户的设置里;语义在类型注释里钉死。
  */
 export type TagPromptMode = 'builtin' | 'relay';
 
@@ -1124,7 +1147,13 @@ export interface RelaySettings {
   model: string;
   /** 采样温度:提词任务建议 0.7~0.9。 */
   temperature: number;
-  /** 单次回复上限 token:一行 tag 用不了太多,300~500 足够。 */
+  /**
+   * 单次回复上限 token。
+   *
+   * 自 0.7 起这次请求要同时产出 thinking、多张图的 tag/nl、changes 建档与 transient,
+   * 早先「一行 tag 300~500 足够」的口径已不成立:400 会在建档那几轮被截断,
+   * 表现为「JSON 缺右括号 → 解析失败 → 白白重试」。默认值见 relayDefaults。
+   */
   maxTokens: number;
   /** 单次请求超时(秒)。 */
   timeoutSec: number;
@@ -1132,7 +1161,12 @@ export interface RelaySettings {
   styleSuffix: string;
   /** 恒定负面词:同样前置在负面提示词最前面。 */
   negative: string;
-  /** 让模型额外输出负面词(输出 POSITIVE:/NEGATIVE: 两段)。 */
+  /**
+   * 【已下线,保留键以兼容存量设置】让模型额外输出 POSITIVE:/NEGATIVE: 两段。
+   *
+   * 现在负面词走同一次输出里的 `negative` 字段(按工作流是否吃负面决定要不要),
+   * 与正面 tag 成对产出,不再需要模型自己分段。恒不生效。
+   */
   wantNegative: boolean;
   /** 编译失败重试次数(请求异常 / 输出验收不过都算)。 */
   retryCount: number;
@@ -1168,9 +1202,14 @@ export interface PurgeLayerSettings {
  *
  * relaySpec / relaySystem 只在提示词方式为中转站时生效,两处也都支持 {{#nl}}/{{^nl}} 条件段,
  * 与内置链共用同一份「生成自然语言」开关口径(见 autoTag/prompt.ts 的 autoTagProfile)。
+ *
+ * 0.7 起这两条**不再是另一套契约**:relay 模式与内置模式走同一份协议、同一段
+ * 角色库/建档/changes/transient 规则,relaySystem 只替换「开场身份与交付物口径」,
+ * relaySpec 追加在它后面充当编译侧的书写规范。因此它俩**可以和内置链的规范同时生效**
+ * (设置页也不再按模式互相隐藏)。
  */
 export interface AutoTagPrompts {
-  /** 提示词方式:内置 LLM 分析 还是 走中转站编译。 */
+  /** 提示词方式:这次请求发给哪台模型(内置渠道 / 中转站)。协议完全相同。 */
   mode: TagPromptMode;
   /** 中转站 system 提示词({{story}} {{note}} 等占位符,见 relay/prompt.ts 的 renderTemplate)。 */
   relaySystem: string;
@@ -1300,7 +1339,10 @@ function relayDefaults(): RelaySettings {
     key: '',
     model: '',
     temperature: 0.8,
-    maxTokens: 400,
+    // 一次输出里同时有 thinking + images(每张 tag/nl/characters)+ changes + transient,
+    // 建档那几轮还要抄一遍外貌字段。400 会把 JSON 拦腰截断(右括号消失 → 解析失败),
+    // 4000 对常见模型是一次能稳稳写完的量;存量设置里的 400 由 normalize 抬到下限。
+    maxTokens: 4000,
     timeoutSec: 120,
     styleSuffix: '',
     negative:
@@ -1472,6 +1514,9 @@ function defaults(): ImageSettings {
       // 默认开:装了这个插件的人要的就是「她能记住自己此刻穿着什么」;
       // 代价是每楼多一次模型调用,觉得费 token 的在角色页关掉即可。
       transientAutoRead: true,
+      // 空:升级即旧行为(整楼正文都能选画面),不想限定范围的人不用碰这两格。
+      targetTags: [],
+      targetStripTags: [],
       prompts: {
         // 默认仍是内置链:升级时不改变存量用户的画面口径(中转站没配 url 也跑不动)
         mode: 'builtin',
@@ -1982,6 +2027,22 @@ export function sanitizeTagName(raw: string): string {  return String(raw ?? '')
     .replace(/[<>/\\\s.*+?^${}()|[\]]/g, ''); // 剔除尖括号/斜杠/空白/正则元字符,中文等保留
 }
 
+/**
+ * 标签名单清洗:数组 → 消毒后的去重数组;缺字段 / 类型不符 → 回退默认。
+ * 与 excludes.customStripTags 同一套消毒规则(sanitizeTagName),中文标签照样保留。
+ */
+function normalizeTagNames(raw: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(raw)) return [...fallback];
+  return Array.from(
+    new Set(
+      raw
+        .filter((item): item is string => typeof item === 'string')
+        .map(item => sanitizeTagName(item))
+        .filter(Boolean),
+    ),
+  );
+}
+
 /** 排除名单清洗(与柏宝书 normalize 同口径):去空、去重、标签名消毒;缺字段/类型不符回退空数组。 */
 function normalizeExcludes(raw: unknown): ExcludesSettings {
   const d = excludesDefaults();
@@ -2051,7 +2112,9 @@ function normalizeRelay(raw: unknown, def: RelaySettings): RelaySettings {
     key: str('key', def.key),
     model: str('model', def.model).trim(),
     temperature: num('temperature', def.temperature, 0, 2),
-    maxTokens: Math.floor(num('maxTokens', def.maxTokens, 32, 65535)),
+    // 下限抬到 1200:低于这个数的存量配置(旧默认 400)会把结构化 JSON 截断,
+    // 表现形式是「改了协议以后突然全是解析失败」,而用户根本不知道是 token 不够。
+    maxTokens: Math.floor(num('maxTokens', def.maxTokens, 1200, 65535)),
     timeoutSec: Math.floor(num('timeoutSec', def.timeoutSec, 5, 900)),
     styleSuffix: str('styleSuffix', def.styleSuffix),
     negative: str('negative', def.negative),
@@ -2152,6 +2215,9 @@ function normalize(raw: unknown): ImageSettings {
       typeof rt.transientAutoRead === 'boolean'
         ? rt.transientAutoRead
         : d.autoTag.transientAutoRead,
+    // 标签名单:同一份清洗口径(去尖括号/去元字符/去重),存量配置没有这两个键 → 空名单
+    targetTags: normalizeTagNames(rt.targetTags, d.autoTag.targetTags),
+    targetStripTags: normalizeTagNames(rt.targetStripTags, d.autoTag.targetStripTags),
     // 可编辑提示词集:逐字段兜底;旧版 jailbreakPrompt 字段迁移进 prompts.jailbreak
     prompts: (() => {
       const rp = (rt.prompts ?? {}) as Partial<AutoTagPrompts>;
@@ -2169,7 +2235,7 @@ function normalize(raw: unknown): ImageSettings {
       // 不能因为「假值 = 没有」而在下次启动又被自启翻回来 —— 那是自启最烦人的那种 bug。
       const preset = normalizePurgeCorePreset(rp.purgeCorePreset, d.autoTag.prompts.purgeCorePreset);
       return {
-        // 老配置没有 mode:落回内置链,画面口径与升级前完全一致(中转站要用户主动切)
+        // 老配置没有 mode:落回内置链(用哪台模型而已,协议两边一样,中转站要用户主动切)
         mode: rp.mode === 'relay' ? 'relay' : 'builtin',
         relaySystem: typeof rp.relaySystem === 'string' ? rp.relaySystem : '',
         relaySpec: typeof rp.relaySpec === 'string' ? rp.relaySpec : '',
@@ -2232,6 +2298,8 @@ function applyInto(target: ImageSettings, src: ImageSettings): void {
   target.autoTag.retryCount = src.autoTag.retryCount;
   target.autoTag.autoGenerate = src.autoTag.autoGenerate;
   target.autoTag.transientAutoRead = src.autoTag.transientAutoRead;
+  target.autoTag.targetTags = [...src.autoTag.targetTags];
+  target.autoTag.targetStripTags = [...src.autoTag.targetStripTags];
   // prompts 逐字段赋,不能整块替换:整块换上来的是 normalize 新建的普通对象,
   // 换进 reactive 根时会再包一层 —— 设置页的 v-model 写着写着就和设置真身分家了。
   const tp = src.autoTag.prompts;
