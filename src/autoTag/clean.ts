@@ -108,6 +108,12 @@ interface SourceLineRange {
 
 /** 正文选取/排除标签:只影响「这一轮选画面的范围」,不改历史楼层文本。 */
 export interface TargetRangeOptions {
+  /**
+   * 选取名单非空、但这一楼连一个容器标签都没出现时,是否回退到整楼。
+   * 默认 false(严格):测试与显式调用要能重现「按标签裁剪」的确定性结果。
+   * runner 传 true —— 线上宁可多画一张,也不要因为模型换了个容器名就静默罢工。
+   */
+  fallbackToWholeSource?: boolean;
   /** 只在这些标签包住的段落里选画面。空/未给 = 整楼都算候选。 */
   keepTags?: string[];
   /** 这些标签包住的段落整块剔掉(在选取之前生效)。 */
@@ -212,6 +218,31 @@ function innerRangeRegexes(tag: string): RegExp[] {
   ];
 }
 
+/**
+ * 选取名单的最终口径。fallbackToWholeSource 用于「这一楼根本没有容器」的情形:
+ * 提示词里若写了 <content_fox> 而这一楼的正文没包,按严格口径就是 0 段、整轮 abort
+ * (实测最常见的原因:AI 换了容器名、或那一楼是纯对话)。选画面是附加能力,
+ * 不该因为它让整楼失去配图机会 —— 所以回退到整楼,并由调用方在日志里留痕。
+ */
+function resolveSelectionRanges(
+  source: string,
+  tags: string[],
+  fallbackToWholeSource: boolean,
+): RemovalRange[] | null {
+  const selected = targetSelectionRanges(source, tags);
+  if (selected === null) return null;
+  if (selected.length) return selected;
+  if (!fallbackToWholeSource) return selected;
+  return null;
+}
+
+/** 这一楼正文里是否出现了名单中任一标签的开/闭标签(用于日志与 UI 提示)。 */
+export function hasSelectionTag(source: string, tags: string[]): boolean {
+  const clean = tags.filter(Boolean);
+  if (!clean.length) return false;
+  return clean.some(tag => new RegExp("\\u003c/?\\s*" + tag + "(?=[\\s/\\u003e])", "i").test(source));
+}
+
 function targetSelectionRanges(source: string, tags: string[]): RemovalRange[] | null {
   const clean = tags.filter(Boolean);
   if (!clean.length) return null;
@@ -282,7 +313,8 @@ function targetRemovalRanges(
   // 否则「排除段落在选取段里」时会被选取范围又捞回来。
   noise.push(...targetExcludeRanges(source, options.stripTags ?? []));
 
-  const keep = targetSelectionRanges(source, options.keepTags ?? []);
+  // 选取标签一个都没在这楼出现时,整楼都算候选 —— 见 resolveSelectionRanges 的说明。
+  const keep = resolveSelectionRanges(source, options.keepTags ?? [], options.fallbackToWholeSource === true);
 
   // 选取标签的标签壳不该留在正文里(模型会把 <正文> 当成叙事的一部分)。
   // 只删壳、保留内容:用内部区间把整块匹配切成「左壳 + 内文 + 右壳」。

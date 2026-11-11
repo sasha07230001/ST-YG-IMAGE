@@ -5,7 +5,7 @@ import {
   resolveCharAnchors,
   type PositionedCharOp,
 } from '@/autoTag/charAnchors';
-import { prepareTargetText } from '@/autoTag/clean';
+import { hasSelectionTag, prepareTargetText } from '@/autoTag/clean';
 import { clearTransient, setTransientForChar, temporaryPrompt } from '@/state/characterPromptStore';
 import { beginGeneration, clearGeneration, consumeGeneration } from '@/autoTag/generationGate';
 import { autoTagProfile, buildAutoTagMessages } from '@/autoTag/prompt';
@@ -278,7 +278,19 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   const preparedTarget = prepareTargetText(source, settings.excludes.customStripTags, {
     keepTags: settings.autoTag.targetTags,
     stripTags: settings.autoTag.targetStripTags,
+    // 这一楼根本没出现选取标签时回退整楼:配图是附加能力,不该因为模型换了容器名就整楼罢工。
+    fallbackToWholeSource: true,
   });
+  // 回退过一次就留痕,方便事后分辨「按容器选的」与「没容器只能整楼选」。
+  const selectionFallback =
+    settings.autoTag.targetTags.length > 0 && !hasSelectionTag(source, settings.autoTag.targetTags);
+  if (selectionFallback && opts.manual) {
+    toastr.info(
+      `本楼正文里没有 ${settings.autoTag.targetTags.map(tag => '<' + tag + '>').join('、')} 容器，这次按整楼正文选画面`,
+      'YG 插图师',
+    );
+  }
+  if (selectionFallback) diagnostic('runForFloor:selection-fallback', { floor, keepTags: settings.autoTag.targetTags });
   if (!preparedTarget.segments.length) {
     abort(
       floor,
@@ -337,8 +349,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     const targetStory = preparedTarget.segments.map(segment => segment.text).join(String.fromCharCode(10, 10));
     seedChatProfilesFromText(targetStory, floor);
     rememberStoryText(targetStory);
-  rememberStoryText(targetStory);
-  const presentNow = resolvePresentProfiles({ story: targetStory });
+    const presentNow = resolvePresentProfiles({ story: targetStory });
     const profileBlock = buildChatProfileBlock(chatProfiles.entries, presentNow);
     // 纯本地渲染:档案区块直接取自本聊天档案,不再让模型自己维护一份外貌库
     const anchors = { text: profileBlock, names: presentNow };

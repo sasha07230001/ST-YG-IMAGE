@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { prepareTargetText } from '@/autoTag/clean';
+import { prepareTargetText, hasSelectionTag } from '@/autoTag/clean';
 
 const STORY = [
   '<正文>',
@@ -65,5 +65,36 @@ describe('clean:正文选取标签', () => {
     expect(text).toContain('她笑了。');
     expect(text).not.toContain('<场面>');
     expect(text).not.toContain('</场面>');
+  });
+
+  it('名单非空但这一楼没有容器时,按整楼正文选(不静默罢工)', () => {
+    const mes = '她把伞收起来。\n\n雨还在下。';
+    const strict = prepareTargetText(mes, [], { keepTags: ['content_fox'], stripTags: [] });
+    expect(strict.segments).toHaveLength(0);
+    const fallback = prepareTargetText(mes, [], {
+      keepTags: ['content_fox'],
+      stripTags: [],
+      fallbackToWholeSource: true,
+    });
+    expect(fallback.segments.length).toBe(2);
+    expect(fallback.promptText).toContain('她把伞收起来。');
+  });
+
+  it('有容器时回退开关不改变结果', () => {
+    const mes = '<content_fox>她站在雨里。</content_fox>\n雨声盖住了脚步。';
+    const strict = prepareTargetText(mes, [], { keepTags: ['content_fox'], stripTags: [] });
+    const fallback = prepareTargetText(mes, [], {
+      keepTags: ['content_fox'],
+      stripTags: [],
+      fallbackToWholeSource: true,
+    });
+    expect(fallback.promptText).toBe(strict.promptText);
+  });
+
+  it('hasSelectionTag 认得开标签与闭标签', () => {
+    expect(hasSelectionTag('<content_fox~>甲</content_fox~>', ['content_fox~'])).toBe(true);
+    expect(hasSelectionTag('只剩 </content_fox~> 了', ['content_fox~'])).toBe(true);
+    expect(hasSelectionTag('完全没有容器的正文', ['content_fox~'])).toBe(false);
+    expect(hasSelectionTag('任意正文', [])).toBe(false);
   });
 });
